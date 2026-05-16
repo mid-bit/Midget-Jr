@@ -1,0 +1,846 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Midget jr.</title>
+
+  <!-- Distinctive font pair: Geist + Geist Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:#11111b; --panel:#1e1e2e; --panel-2:#181825;
+      --border:#313244; --border-2:#45475a; --text:#cdd6f4; --muted:#6c7086; --sub:#a6adc8;
+      --pink:#f38ba8; --blue:#89b4fa; --green:#a6e3a1; --purple:#cba6f7; --yellow:#f9e2af; --teal:#74c7ec; --orange:#fab387;
+    }
+    body {
+      font-family: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg); color: var(--text);
+      height: 100vh; height: 100dvh;
+      display: flex; flex-direction: column; align-items: center;
+      -webkit-font-smoothing: antialiased;
+    }
+    code, pre, .mono { font-family: 'Geist Mono', 'Fira Code', 'Courier New', monospace; }
+
+    @keyframes bounce { 0%,100%{transform:translateY(0);opacity:.4} 50%{transform:translateY(-6px);opacity:1} }
+    @keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: var(--panel); }
+    ::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 3px; }
+
+    #app { width: 100%; max-width: 860px; display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
+
+    /* Header */
+    #header { padding: 16px 24px 0; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+    #header .avatar {
+      width: 40px; height: 40px; border-radius: 12px;
+      background: linear-gradient(135deg, var(--blue), var(--purple));
+      display: flex; align-items: center; justify-content: center; font-size: 20px;
+    }
+    #header h1 { font-size: 16px; font-weight: 700; letter-spacing: -0.01em; }
+    #header p  { font-size: 11px; color: var(--muted); margin-top: 1px; }
+    #lock-toggle {
+      margin-left: auto; background: var(--panel); color: var(--text);
+      border: 1px solid var(--border); border-radius: 20px; padding: 6px 12px;
+      font-size: 12px; cursor: pointer; font-family: inherit;
+      display: inline-flex; align-items: center; gap: 6px;
+      transition: all .2s;
+    }
+    #lock-toggle:hover { border-color: var(--border-2); }
+    #lock-toggle.unlocked { color: var(--green); border-color: #a6e3a155; }
+
+    /* Tabs */
+    #tabs { padding: 12px 24px 0; display: flex; gap: 6px; flex-wrap: wrap; flex-shrink: 0; }
+    .tab {
+      padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 600;
+      cursor: pointer; border: 1px solid var(--border); background: var(--panel); color: var(--muted);
+      transition: all 0.2s; font-family: inherit;
+    }
+    .tab:hover { color: var(--text); }
+    .tab.active-chat     { background: var(--pink);   color: var(--panel); border-color: var(--pink); }
+    .tab.active-query    { background: var(--blue);   color: var(--panel); border-color: var(--blue); }
+    .tab.active-research { background: var(--green);  color: var(--panel); border-color: var(--green); }
+    .tab.active-code     { background: var(--purple); color: var(--panel); border-color: var(--purple); }
+    .tab.active-import   { background: var(--orange); color: var(--panel); border-color: var(--orange); }
+    .tab.active-queue    { background: var(--yellow); color: var(--panel); border-color: var(--yellow); }
+
+    #lang-select {
+      background: var(--panel); color: var(--text);
+      border: 1px solid var(--border); border-radius: 20px; padding: 6px 12px;
+      font-size: 12px; cursor: pointer; font-family: inherit;
+    }
+
+    /* Mode label */
+    #mode-label { padding: 8px 24px 0; font-size: 11px; color: var(--muted); flex-shrink: 0; }
+
+    /* Messages */
+    #messages { flex: 1; overflow-y: auto; padding: 14px 24px 8px; }
+    .msg-row { display: flex; margin-bottom: 12px; align-items: flex-end; gap: 8px; animation: fadeIn .22s ease; }
+    .msg-row.user { justify-content: flex-end; }
+    .msg-row.bot  { justify-content: flex-start; }
+    .bubble-avatar {
+      width: 30px; height: 30px; border-radius: 50%; flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 13px; font-weight: 700;
+    }
+    .bubble-avatar.bot  { background: linear-gradient(135deg, var(--blue), var(--purple)); }
+    .bubble-avatar.user { background: linear-gradient(135deg, var(--pink), var(--orange)); color: var(--panel); }
+    .bubble {
+      max-width: 76%; padding: 10px 14px; font-size: 13.5px; line-height: 1.6;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.2); white-space: pre-wrap; word-break: break-word;
+    }
+    .bubble.bot  { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 16px 16px 16px 4px; }
+    .bubble.user { background: linear-gradient(135deg, var(--blue), var(--teal)); color: var(--panel); border-radius: 16px 16px 4px 16px; }
+
+    /* result cards */
+    .result-card { margin-top: 9px; background: var(--panel-2); border-radius: 10px; padding: 9px 12px; border: 1px solid var(--border-2); }
+    .r-topic   { color: var(--blue); font-weight: 600; font-size: 12.5px; }
+    .r-summary { color: var(--sub); font-size: 12px; margin-top: 3px; }
+    .r-source  { color: var(--teal); font-size: 11px; margin-top: 4px; display: inline-block; text-decoration: none; }
+    .r-source:hover { text-decoration: underline; }
+    .r-tags    { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 5px; }
+    .r-tag     { background: var(--border); color: var(--purple); font-size: 10px; padding: 2px 7px; border-radius: 20px; }
+
+    /* code */
+    .code-wrap { position: relative; margin-top: 9px; }
+    .code-lang { color: var(--blue); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 5px; }
+    pre.code-block {
+      background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 12px;
+      font-size: 12px; color: var(--text);
+      overflow-x: auto; white-space: pre-wrap; word-break: break-word;
+    }
+    .copy-btn {
+      position: absolute; top: 5px; right: 7px; background: var(--border); color: var(--text);
+      border: none; border-radius: 6px; padding: 3px 9px; font-size: 11px; cursor: pointer; transition: all 0.2s;
+      font-family: inherit;
+    }
+    .copy-btn:hover { background: var(--border-2); }
+    .copy-btn.copied { background: var(--green); color: var(--panel); }
+
+    /* context badge */
+    .ctx-badge {
+      display: inline-block; margin-top: 6px; font-size: 10px;
+      background: var(--border); color: var(--blue); border-radius: 20px; padding: 2px 9px;
+    }
+
+    /* typing */
+    .typing { display: flex; gap: 4px; align-items: center; padding: 3px 0; }
+    .typing span { width: 6px; height: 6px; border-radius: 50%; background: var(--blue); animation: bounce 1s ease-in-out infinite; }
+    .typing span:nth-child(2) { animation-delay: 0.2s; }
+    .typing span:nth-child(3) { animation-delay: 0.4s; }
+
+    /* Input */
+    #input-bar { padding: 0 24px 18px; flex-shrink: 0; }
+    #input-wrap {
+      display: flex; gap: 8px; align-items: flex-end; background: var(--panel); border-radius: 14px;
+      padding: 10px 14px; border: 1px solid #f38ba844; box-shadow: 0 0 18px #f38ba811; transition: all 0.2s;
+    }
+    #chat-input {
+      flex: 1; background: transparent; border: none; color: var(--text); font-size: 13.5px;
+      resize: none; font-family: inherit; line-height: 1.5; max-height: 110px; overflow-y: auto; outline: none;
+    }
+    #send-btn {
+      width: 34px; height: 34px; border-radius: 9px; flex-shrink: 0;
+      background: linear-gradient(135deg, var(--blue), var(--purple));
+      border: none; cursor: pointer; font-size: 15px;
+      display: flex; align-items: center; justify-content: center; color: var(--panel); transition: opacity 0.2s;
+    }
+    #send-btn:disabled { opacity: 0.4; cursor: not-allowed; background: var(--border); }
+    #input-hint { text-align: center; color: var(--border-2); font-size: 10.5px; margin-top: 6px; }
+
+    /* Panels (queue + import) */
+    .side-panel { padding: 0 24px 80px; flex: 1; overflow-y: auto; display: none; }
+    .panel-card { background: var(--panel); border-radius: 14px; padding: 14px; border: 1px solid var(--border); margin-bottom: 16px; margin-top: 14px; }
+    .panel-card h3 { font-size: 13px; font-weight: 600; margin-bottom: 10px; color: var(--text); letter-spacing: -0.005em; }
+    .panel-card .hint { font-size: 11px; color: var(--muted); margin-top: 8px; line-height: 1.5; }
+
+    .row-flex { display: flex; gap: 8px; flex-wrap: wrap; }
+    .qinput {
+      flex: 1; min-width: 150px; background: var(--panel-2); border: 1px solid var(--border-2);
+      border-radius: 10px; padding: 8px 12px; color: var(--text); font-size: 13px; outline: none; font-family: inherit;
+    }
+    .qselect {
+      background: var(--panel-2); border: 1px solid var(--border-2); border-radius: 10px;
+      padding: 8px 12px; color: var(--text); font-size: 13px; cursor: pointer; font-family: inherit;
+    }
+    .qbtn {
+      background: linear-gradient(135deg, var(--blue), var(--purple)); color: var(--panel);
+      border: none; border-radius: 10px; padding: 8px 16px; font-weight: 700; font-size: 13px;
+      cursor: pointer; font-family: inherit; transition: opacity .2s;
+    }
+    .qbtn:hover:not(:disabled) { opacity: .9; }
+    .qbtn:disabled { opacity: 0.4; cursor: not-allowed; background: var(--border); color: var(--text); }
+    .qbtn.warn { background: var(--pink); color: var(--panel); }
+
+    /* Queue items */
+    .queue-item {
+      background: var(--panel); border-radius: 12px; padding: 10px 13px; border: 1px solid var(--border);
+      display: flex; align-items: center; gap: 10px; margin-bottom: 7px; animation: fadeIn 0.2s ease;
+    }
+    .qi-icon  { font-size: 16px; flex-shrink: 0; }
+    .qi-topic { color: var(--text); font-weight: 600; font-size: 13px; word-break: break-word; }
+    .qi-meta  { display: flex; gap: 6px; margin-top: 3px; flex-wrap: wrap; }
+    .qi-tag   { font-size: 10px; padding: 2px 7px; border-radius: 20px; background: var(--border); }
+    .qi-del   { margin-left: auto; background: transparent; border: none; color: var(--border-2); cursor: pointer; font-size: 15px; padding: 4px; flex-shrink: 0; }
+    .qi-del:hover { color: var(--pink); }
+    .empty-state { color: var(--muted); text-align: center; padding: 40px 0; font-size: 14px; }
+
+    /* Import dropzone */
+    #dropzone {
+      border: 2px dashed var(--border-2); border-radius: 14px; padding: 28px 18px;
+      text-align: center; color: var(--muted); font-size: 13px;
+      transition: all .2s; cursor: pointer; background: var(--panel-2);
+    }
+    #dropzone:hover, #dropzone.drag { border-color: var(--orange); color: var(--text); background: #fab38711; }
+    #dropzone .big { font-size: 28px; margin-bottom: 8px; }
+    #dropzone .types { font-size: 10.5px; color: var(--border-2); margin-top: 6px; font-family: 'Geist Mono', monospace; }
+    .import-row {
+      background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px;
+      padding: 9px 12px; margin-top: 8px; display: flex; gap: 10px; align-items: center;
+      font-size: 12.5px; animation: fadeIn .2s ease;
+    }
+    .import-row .name { flex: 1; color: var(--text); word-break: break-all; }
+    .import-row .status { font-size: 11px; }
+    .status.ok { color: var(--green); }
+    .status.err { color: var(--pink); }
+    .status.pending { color: var(--yellow); }
+
+    /* Lock dialog */
+    .modal-bg {
+      position: fixed; inset: 0; background: rgba(0,0,0,.55);
+      display: flex; align-items: center; justify-content: center; z-index: 100;
+      animation: fadeIn .15s ease; backdrop-filter: blur(4px);
+    }
+    .modal {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 16px;
+      padding: 22px; width: min(360px, 90vw); box-shadow: 0 12px 40px rgba(0,0,0,.5);
+    }
+    .modal h2 { font-size: 16px; margin-bottom: 6px; }
+    .modal p { font-size: 12.5px; color: var(--muted); margin-bottom: 14px; line-height: 1.5; }
+    .modal input {
+      width: 100%; background: var(--panel-2); border: 1px solid var(--border-2);
+      border-radius: 10px; padding: 10px 12px; color: var(--text); font-size: 13.5px;
+      outline: none; font-family: inherit;
+    }
+    .modal input:focus { border-color: var(--orange); }
+    .modal .err { color: var(--pink); font-size: 11.5px; margin-top: 6px; min-height: 14px; }
+    .modal .actions { display: flex; gap: 8px; margin-top: 14px; justify-content: flex-end; }
+    .modal .btn-cancel {
+      background: transparent; border: 1px solid var(--border-2); color: var(--text);
+      border-radius: 10px; padding: 8px 14px; cursor: pointer; font-family: inherit; font-size: 13px;
+    }
+
+    /* Mobile */
+    @media (max-width: 560px) {
+      #header { padding: 12px 14px 0; }
+      #tabs { padding: 10px 14px 0; gap: 5px; }
+      .tab { padding: 5px 11px; font-size: 11.5px; }
+      #lang-select { width: 100%; margin-top: 4px; }
+      #mode-label { padding: 8px 14px 0; }
+      #messages { padding: 12px 14px 6px; }
+      .bubble { max-width: 82%; font-size: 13px; }
+      #input-bar { padding: 0 14px 14px; }
+      .side-panel { padding: 0 14px 80px; }
+      #lock-toggle { padding: 5px 10px; font-size: 11.5px; }
+    }
+  </style>
+</head>
+<body>
+<div id="app">
+
+  <div id="header">
+    <div class="avatar">🧠</div>
+    <div>
+      <h1>Midget jr.</h1>
+      <p>Self-growing · Research · Chat · Code</p>
+    </div>
+    <button id="lock-toggle" type="button" title="Toggle admin lock">
+      <span id="lock-icon">🔒</span><span id="lock-text">Locked</span>
+    </button>
+  </div>
+
+  <div id="tabs">
+    <button class="tab active-chat" data-mode="chat"     type="button">💬 Chat</button>
+    <button class="tab"             data-mode="query"    type="button">🔍 Query</button>
+    <button class="tab"             data-mode="research" type="button">🌐 Research</button>
+    <button class="tab"             data-mode="code"     type="button">💻 Code</button>
+    <button class="tab"             data-mode="import"   type="button">📂 Import</button>
+    <button class="tab"             data-mode="queue"    type="button">📋 Queue</button>
+    <select id="lang-select" style="display:none">
+      <option>python</option><option>javascript</option><option>typescript</option>
+      <option>java</option><option>c++</option><option>go</option>
+      <option>rust</option><option>sql</option><option>bash</option>
+    </select>
+  </div>
+
+  <div id="mode-label">💬 Chat — ask me anything, I'll use my knowledge base + AI</div>
+
+  <div id="messages"></div>
+
+  <!-- Queue panel -->
+  <div id="queue-panel" class="side-panel">
+    <div class="panel-card">
+      <h3>➕ Add topic to auto-research queue</h3>
+      <div class="row-flex">
+        <input id="q-topic" class="qinput" placeholder="Topic to research..."/>
+        <select id="q-cat" class="qselect">
+          <option>General</option><option>Science</option><option>Technology</option>
+          <option>History</option><option>Math</option><option>Health</option>
+          <option>Philosophy</option><option>Art</option>
+        </select>
+        <button class="qbtn" id="q-add-btn" type="button">Add</button>
+      </div>
+      <div class="hint">🔒 Adding and deleting items requires the admin password.</div>
+    </div>
+    <div id="queue-list"><div class="empty-state">Loading queue...</div></div>
+  </div>
+
+  <!-- Import panel -->
+  <div id="import-panel" class="side-panel">
+    <div class="panel-card">
+      <h3>📂 Import files into Midget's brain</h3>
+      <label id="dropzone" for="file-input">
+        <div class="big">⬆️</div>
+        <div><strong>Drop files here</strong> or click to choose</div>
+        <div class="types">.txt .md .json .csv .log .yaml .yml .xml .html .css .js .ts .py .go .rs .java .cpp .c .h .sh .sql</div>
+        <input id="file-input" type="file" multiple style="display:none"
+          accept=".txt,.md,.markdown,.json,.csv,.log,.yaml,.yml,.xml,.html,.htm,.css,.js,.mjs,.ts,.tsx,.jsx,.py,.go,.rs,.java,.cpp,.cc,.c,.h,.hpp,.sh,.bash,.sql,.toml,.ini,.conf,.rb,.php,.swift,.kt"/>
+      </label>
+      <div class="row-flex" style="margin-top:12px;">
+        <input id="i-category" class="qinput" placeholder="Category (optional)" value="Imported"/>
+        <input id="i-tags" class="qinput" placeholder="Tags, comma-separated (optional)"/>
+      </div>
+      <div class="hint">🔒 Importing requires the admin password. Files are read in-browser and saved as knowledge entries (text only, max 1&nbsp;MB each).</div>
+    </div>
+    <div id="import-list"></div>
+  </div>
+
+  <div id="input-bar">
+    <div id="input-wrap">
+      <textarea id="chat-input" rows="1" placeholder="Ask me anything..."></textarea>
+      <button id="send-btn" type="button">↑</button>
+    </div>
+    <div id="input-hint">Enter to send · Shift+Enter for new line</div>
+  </div>
+
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  // ── Config ──────────────────────────────────────────────────────────────
+  const APP_ID    = "69fd1ce01ca9149f4a452cbd";
+  const BASE_URL  = `https://base44.app/api/apps/${APP_ID}`;
+  // If your base44 knowledge entity is not "KnowledgeEntry", change it here:
+  const KB_ENTITY = "KnowledgeEntry";
+
+  // Admin password (client-side gate only — not real security)
+  const ADMIN_PASSWORD = "MidgetsRcool";
+  const UNLOCK_KEY     = "mj_unlocked";
+  const HISTORY_KEY    = "mj_chat_history";
+  const MAX_FILE_BYTES = 1024 * 1024; // 1 MB
+
+  // ── State ───────────────────────────────────────────────────────────────
+  let currentMode = "chat";
+  let currentLang = "python";
+  let isLoading   = false;
+  let chatHistory = loadHistory();
+
+  const modeColors = {
+    chat:"#f38ba8", query:"#89b4fa", research:"#a6e3a1",
+    code:"#cba6f7", import:"#fab387", queue:"#f9e2af"
+  };
+  const modeLabels = {
+    chat:     "💬 Chat — ask me anything, I'll use my knowledge base + AI",
+    query:    "🔍 Query — search exact entries in the knowledge base",
+    research: "🌐 Research — fetch info from the web and save it",
+    code:     "💻 Code — generate code with AI and save it",
+    import:   "📂 Import — upload files to grow Midget's brain (admin)",
+    queue:    "📋 Queue — topics scheduled for auto-research every 6 hours"
+  };
+  const modePlaceholders = {
+    chat:     "Ask me anything...",
+    query:    "Search the knowledge base...",
+    research: "Enter a topic to research from the web...",
+    code:     "Describe the code you need..."
+  };
+
+  // ── DOM refs ────────────────────────────────────────────────────────────
+  const $ = (id) => document.getElementById(id);
+  const messagesEl = $("messages");
+  const queuePanel = $("queue-panel");
+  const importPanel = $("import-panel");
+  const inputBar   = $("input-bar");
+  const langSel    = $("lang-select");
+  const inputWrap  = $("input-wrap");
+  const chatInput  = $("chat-input");
+  const modeLabel  = $("mode-label");
+  const sendBtn    = $("send-btn");
+  const lockBtn    = $("lock-toggle");
+  const lockIcon   = $("lock-icon");
+  const lockText   = $("lock-text");
+
+  // ── API helpers ─────────────────────────────────────────────────────────
+  async function callFn(name, payload) {
+    const res = await fetch(`${BASE_URL}/functions/${name}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const data = await safeJson(res);
+    if (!res.ok) throw new Error((data && data.error) || `HTTP ${res.status}`);
+    return data || {};
+  }
+  async function entityList(entity) {
+    const res = await fetch(`${BASE_URL}/entities/${entity}`, { method: "GET" });
+    const data = await safeJson(res);
+    if (!res.ok) throw new Error((data && data.error) || `HTTP ${res.status}`);
+    return Array.isArray(data) ? data : (data && data.records) || [];
+  }
+  async function entityCreate(entity, body) {
+    const res = await fetch(`${BASE_URL}/entities/${entity}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    const data = await safeJson(res);
+    if (!res.ok) throw new Error((data && data.error) || `HTTP ${res.status}`);
+    return data || {};
+  }
+  async function entityDelete(entity, id) {
+    const res = await fetch(`${BASE_URL}/entities/${entity}/${id}`, { method: "DELETE" });
+    if (!res.ok) {
+      const d = await safeJson(res);
+      throw new Error((d && d.error) || `HTTP ${res.status}`);
+    }
+  }
+  async function safeJson(res) {
+    const text = await res.text().catch(() => "");
+    if (!text) return null;
+    try { return JSON.parse(text); } catch { return null; }
+  }
+
+  // ── Lock / password gate ────────────────────────────────────────────────
+  function isUnlocked() { return sessionStorage.getItem(UNLOCK_KEY) === "1"; }
+  function setUnlocked(v) {
+    if (v) sessionStorage.setItem(UNLOCK_KEY, "1");
+    else   sessionStorage.removeItem(UNLOCK_KEY);
+    renderLockUI();
+  }
+  function renderLockUI() {
+    const unlocked = isUnlocked();
+    lockIcon.textContent = unlocked ? "🔓" : "🔒";
+    lockText.textContent = unlocked ? "Unlocked" : "Locked";
+    lockBtn.classList.toggle("unlocked", unlocked);
+  }
+  function requireUnlock(actionLabel) {
+    return new Promise((resolve) => {
+      if (isUnlocked()) return resolve(true);
+      showPasswordPrompt(actionLabel, (ok) => resolve(ok));
+    });
+  }
+  function showPasswordPrompt(actionLabel, cb) {
+    const bg = document.createElement("div");
+    bg.className = "modal-bg";
+    bg.innerHTML = `
+      <div class="modal" role="dialog" aria-modal="true">
+        <h2>🔒 Admin password</h2>
+        <p>${esc(actionLabel || "This action requires the admin password.")}</p>
+        <input id="pw-input" type="password" autocomplete="off" placeholder="Password"/>
+        <div class="err" id="pw-err"></div>
+        <div class="actions">
+          <button class="btn-cancel" id="pw-cancel" type="button">Cancel</button>
+          <button class="qbtn" id="pw-ok" type="button">Unlock</button>
+        </div>
+      </div>`;
+    document.body.appendChild(bg);
+    const input = bg.querySelector("#pw-input");
+    const err   = bg.querySelector("#pw-err");
+    setTimeout(() => input.focus(), 30);
+    const close = (ok) => { bg.remove(); cb(ok); };
+    bg.querySelector("#pw-cancel").addEventListener("click", () => close(false));
+    bg.querySelector("#pw-ok").addEventListener("click", () => {
+      if (input.value === ADMIN_PASSWORD) { setUnlocked(true); close(true); }
+      else { err.textContent = "Wrong password."; input.select(); }
+    });
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") bg.querySelector("#pw-ok").click();
+      if (e.key === "Escape") close(false);
+    });
+    bg.addEventListener("click", (e) => { if (e.target === bg) close(false); });
+  }
+
+  // ── Mode switch ─────────────────────────────────────────────────────────
+  function switchMode(mode) {
+    currentMode = mode;
+    document.querySelectorAll(".tab").forEach(t => {
+      t.className = "tab";
+      if (t.dataset.mode === mode) t.className = `tab active-${mode}`;
+    });
+
+    const showMessages = (mode !== "queue" && mode !== "import");
+    const showInput    = (mode === "chat" || mode === "query" || mode === "research" || mode === "code");
+
+    messagesEl.style.display  = showMessages ? "block" : "none";
+    queuePanel.style.display  = mode === "queue"  ? "block" : "none";
+    importPanel.style.display = mode === "import" ? "block" : "none";
+    inputBar.style.display    = showInput ? "block" : "none";
+    modeLabel.style.display   = "block";
+    langSel.style.display     = mode === "code" ? "inline-block" : "none";
+    modeLabel.textContent     = modeLabels[mode];
+
+    if (showInput) {
+      chatInput.placeholder = modePlaceholders[mode];
+      inputWrap.style.borderColor = modeColors[mode] + "44";
+      inputWrap.style.boxShadow   = `0 0 18px ${modeColors[mode]}11`;
+    }
+    if (mode === "queue")  loadQueue();
+  }
+
+  // ── Send ────────────────────────────────────────────────────────────────
+  async function send() {
+    const text = chatInput.value.trim();
+    if (!text || isLoading) return;
+    chatInput.value = ""; chatInput.style.height = "";
+    isLoading = true; sendBtn.disabled = true;
+    addUserMessage(text);
+    const tid = addTyping();
+
+    try {
+      if (currentMode === "chat") {
+        const r = await callFn("chat", { message: text, history: chatHistory });
+        removeTyping(tid);
+        addBotMessage(r.reply, null, r.context_used);
+        chatHistory.push({ role: "user", content: text });
+        chatHistory.push({ role: "assistant", content: r.reply });
+        // Slice in pairs so first item is always a user turn
+        while (chatHistory.length > 12) chatHistory.splice(0, 2);
+        saveHistory();
+      } else if (currentMode === "query") {
+        const r = await callFn("queryKnowledge", { query: text });
+        removeTyping(tid);
+        if (r.results && r.results.length > 0) {
+          addBotMessage(`Found ${r.result_count} result(s):`, r.results);
+        } else {
+          addBotMessage(`🤷 Nothing in the knowledge base about "${text}" yet.\n\nTip: switch to 🌐 Research to fetch and save info, or 📂 Import to upload a file.`);
+        }
+      } else if (currentMode === "research") {
+        const r = await callFn("researchTopic", { topic: text, category: "General" });
+        removeTyping(tid);
+        addBotMessage(r.sources_found > 0
+          ? `✅ Researched and saved!\n\nTopic: ${r.topic}\nSources: ${r.sources_found}\n\n${r.summary || ""}`
+          : `📌 Saved "${text}" to the knowledge base (no web summary found).`);
+      } else if (currentMode === "code") {
+        const r = await callFn("generateCode", { prompt: text, language: currentLang });
+        removeTyping(tid);
+        addCodeMessage(`Here's your ${currentLang} code:`, r.code, currentLang);
+      }
+    } catch(e) {
+      removeTyping(tid);
+      addBotMessage(`❌ Error: ${e.message}`);
+    }
+    isLoading = false; sendBtn.disabled = false;
+  }
+
+  // ── History persistence ────────────────────────────────────────────────
+  function loadHistory() {
+    try {
+      const raw = localStorage.getItem(HISTORY_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch { return []; }
+  }
+  function saveHistory() {
+    try { localStorage.setItem(HISTORY_KEY, JSON.stringify(chatHistory)); } catch {}
+  }
+
+  // ── Render helpers ──────────────────────────────────────────────────────
+  function addUserMessage(text) {
+    const row = document.createElement("div");
+    row.className = "msg-row user";
+    row.innerHTML = `<div class="bubble user"></div><div class="bubble-avatar user">M</div>`;
+    row.querySelector(".bubble").textContent = text;
+    messagesEl.appendChild(row);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+  function addBotMessage(text, results, ctxUsed) {
+    const row = document.createElement("div");
+    row.className = "msg-row bot";
+    row.innerHTML = `<div class="bubble-avatar bot">🧠</div><div class="bubble bot"></div>`;
+    const bubble = row.querySelector(".bubble");
+    bubble.appendChild(document.createTextNode(text));
+    if (results && results.length) {
+      results.forEach(r => bubble.appendChild(resultCard(r)));
+    }
+    if (ctxUsed > 0) {
+      const b = document.createElement("span");
+      b.className = "ctx-badge";
+      b.textContent = `📚 Used ${ctxUsed} knowledge entr${ctxUsed > 1 ? "ies" : "y"}`;
+      bubble.appendChild(document.createElement("br"));
+      bubble.appendChild(b);
+    }
+    messagesEl.appendChild(row);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+  function resultCard(r) {
+    const card = document.createElement("div");
+    card.className = "result-card";
+    const topic = document.createElement("div");
+    topic.className = "r-topic"; topic.textContent = r.topic || "(untitled)";
+    const summary = document.createElement("div");
+    summary.className = "r-summary"; summary.textContent = r.summary || "";
+    card.appendChild(topic); card.appendChild(summary);
+    if (r.source_url) {
+      const a = document.createElement("a");
+      a.className = "r-source"; a.href = r.source_url; a.target = "_blank"; a.rel = "noreferrer";
+      a.textContent = "🔗 Source";
+      card.appendChild(a);
+    }
+    if (Array.isArray(r.tags) && r.tags.length) {
+      const tags = document.createElement("div"); tags.className = "r-tags";
+      r.tags.forEach(t => {
+        const span = document.createElement("span");
+        span.className = "r-tag"; span.textContent = t;
+        tags.appendChild(span);
+      });
+      card.appendChild(tags);
+    }
+    return card;
+  }
+  function addCodeMessage(text, code, lang) {
+    const row = document.createElement("div");
+    row.className = "msg-row bot";
+    row.innerHTML = `
+      <div class="bubble-avatar bot">🧠</div>
+      <div class="bubble bot"></div>`;
+    const bubble = row.querySelector(".bubble");
+    bubble.appendChild(document.createTextNode(text));
+    const wrap = document.createElement("div"); wrap.className = "code-wrap";
+    const langEl = document.createElement("div"); langEl.className = "code-lang"; langEl.textContent = lang;
+    const pre = document.createElement("pre"); pre.className = "code-block"; pre.textContent = code || "";
+    const btn = document.createElement("button"); btn.className = "copy-btn"; btn.type = "button"; btn.textContent = "Copy";
+    btn.addEventListener("click", () => copyCode(pre, btn));
+    wrap.appendChild(langEl); wrap.appendChild(pre); wrap.appendChild(btn);
+    bubble.appendChild(wrap);
+    messagesEl.appendChild(row);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+  function addTyping() {
+    const id = "t" + Date.now() + Math.random().toString(36).slice(2,6);
+    const row = document.createElement("div");
+    row.className = "msg-row bot"; row.id = id;
+    row.innerHTML = `<div class="bubble-avatar bot">🧠</div>
+      <div class="bubble bot"><div class="typing"><span></span><span></span><span></span></div></div>`;
+    messagesEl.appendChild(row);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return id;
+  }
+  function removeTyping(id) { $(id)?.remove(); }
+  function copyCode(pre, btn) {
+    navigator.clipboard.writeText(pre.innerText || "").catch(() => {});
+    btn.textContent = "✓ Copied"; btn.classList.add("copied");
+    setTimeout(() => { btn.textContent = "Copy"; btn.classList.remove("copied"); }, 2000);
+  }
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  }
+
+  // ── Queue ───────────────────────────────────────────────────────────────
+  async function loadQueue() {
+    const list = $("queue-list");
+    list.innerHTML = `<div class="empty-state">Loading queue...</div>`;
+    try {
+      const items = (await entityList("ResearchQueue"))
+        .sort((a,b) => new Date(b.created_date) - new Date(a.created_date));
+      renderQueue(items);
+    } catch(e) {
+      list.innerHTML = `<div class="empty-state">❌ Failed to load: ${esc(e.message)}</div>`;
+    }
+  }
+  function renderQueue(items) {
+    const list = $("queue-list");
+    list.innerHTML = "";
+    if (!items.length) {
+      list.innerHTML = '<div class="empty-state">Queue is empty — add a topic above 👆</div>';
+      return;
+    }
+    const icons  = { pending:"⏳", done:"✅", failed:"❌" };
+    const colors = { pending:"#f9e2af", done:"#a6e3a1", failed:"#f38ba8" };
+    items.forEach(item => {
+      const row = document.createElement("div");
+      row.className = "queue-item"; row.id = "qi-" + item.id;
+      row.innerHTML = `
+        <span class="qi-icon">${icons[item.status]||"⏳"}</span>
+        <div style="flex:1;min-width:0;">
+          <div class="qi-topic"></div>
+          <div class="qi-meta">
+            <span class="qi-tag" style="color:#89b4fa"></span>
+            <span class="qi-tag" style="color:${colors[item.status]||"#f9e2af"}"></span>
+            <span class="qi-tag" style="color:#6c7086"></span>
+          </div>
+        </div>`;
+      row.querySelector(".qi-topic").textContent = item.topic || "(no topic)";
+      const tags = row.querySelectorAll(".qi-tag");
+      tags[0].textContent = item.category || "General";
+      tags[1].textContent = item.status || "pending";
+      tags[2].textContent = item.added_by === "auto" ? "🤖 auto" : "👤 you";
+      if (item.status === "pending") {
+        const del = document.createElement("button");
+        del.className = "qi-del"; del.type = "button"; del.textContent = "✕";
+        del.title = "Delete (admin)";
+        del.addEventListener("click", () => deleteQueueItem(item.id));
+        row.appendChild(del);
+      }
+      list.appendChild(row);
+    });
+  }
+  async function addToQueue() {
+    const topicEl = $("q-topic"), catEl = $("q-cat"), btn = $("q-add-btn");
+    const topic = topicEl.value.trim();
+    if (!topic) return;
+    if (!(await requireUnlock("Adding to the queue requires the admin password."))) return;
+    btn.disabled = true; btn.textContent = "Adding...";
+    try {
+      await entityCreate("ResearchQueue", {
+        topic, category: catEl.value, priority: 2, status: "pending", added_by: "user"
+      });
+      topicEl.value = "";
+      await loadQueue();
+    } catch(e) { alert("Failed: " + e.message); }
+    btn.disabled = false; btn.textContent = "Add";
+  }
+  async function deleteQueueItem(id) {
+    if (!(await requireUnlock("Deleting from the queue requires the admin password."))) return;
+    try {
+      await entityDelete("ResearchQueue", id);
+      $("qi-" + id)?.remove();
+      if (!$("queue-list").children.length) {
+        $("queue-list").innerHTML = '<div class="empty-state">Queue is empty — add a topic above 👆</div>';
+      }
+    } catch(e) { alert("Failed: " + e.message); }
+  }
+
+  // ── File Import ─────────────────────────────────────────────────────────
+  const dropzone   = $("dropzone");
+  const fileInput  = $("file-input");
+  const importList = $("import-list");
+
+  function readFileAsText(file) {
+    return new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload  = () => resolve(String(fr.result || ""));
+      fr.onerror = () => reject(fr.error || new Error("Read failed"));
+      fr.readAsText(file);
+    });
+  }
+  function importRow(name) {
+    const row = document.createElement("div");
+    row.className = "import-row";
+    row.innerHTML = `<span>📄</span><span class="name"></span><span class="status pending">queued…</span>`;
+    row.querySelector(".name").textContent = name;
+    importList.prepend(row);
+    return {
+      set(status, cls) {
+        const s = row.querySelector(".status");
+        s.textContent = status; s.className = "status " + (cls || "pending");
+      }
+    };
+  }
+  async function handleFiles(fileList) {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    if (!(await requireUnlock("Importing files requires the admin password."))) return;
+
+    const category = ($("i-category").value || "Imported").trim() || "Imported";
+    const tagsRaw  = $("i-tags").value || "";
+    const userTags = tagsRaw.split(",").map(s => s.trim()).filter(Boolean);
+
+    for (const file of files) {
+      const ui = importRow(file.name);
+      try {
+        if (file.size > MAX_FILE_BYTES) throw new Error(`too big (${(file.size/1024).toFixed(0)} KB > 1024 KB)`);
+        const text = await readFileAsText(file);
+        if (!text.trim()) throw new Error("file is empty");
+
+        const ext = (file.name.split(".").pop() || "").toLowerCase();
+        const tags = Array.from(new Set([ext, "imported", ...userTags])).filter(Boolean);
+        const summary = text.replace(/\s+/g, " ").trim().slice(0, 500);
+
+        ui.set("uploading…", "pending");
+        await entityCreate(KB_ENTITY, {
+          topic: file.name,
+          category,
+          summary,
+          content: text,
+          source_url: null,
+          tags,
+          added_by: "import"
+        });
+        ui.set("✓ imported", "ok");
+      } catch (e) {
+        ui.set("✗ " + e.message, "err");
+      }
+    }
+  }
+
+  // ── Event wiring ────────────────────────────────────────────────────────
+  document.querySelectorAll(".tab").forEach(t => {
+    t.addEventListener("click", () => switchMode(t.dataset.mode));
+  });
+  langSel.addEventListener("change", e => { currentLang = e.target.value; });
+  sendBtn.addEventListener("click", send);
+  chatInput.addEventListener("keydown", e => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+  chatInput.addEventListener("input", e => {
+    e.target.style.height = "auto";
+    e.target.style.height = Math.min(e.target.scrollHeight, 110) + "px";
+  });
+
+  // Lock toggle
+  lockBtn.addEventListener("click", async () => {
+    if (isUnlocked()) {
+      setUnlocked(false);
+    } else {
+      await requireUnlock("Unlock admin actions (import, queue add/delete).");
+    }
+  });
+
+  // Queue
+  $("q-add-btn").addEventListener("click", addToQueue);
+  $("q-topic").addEventListener("keydown", e => { if (e.key === "Enter") addToQueue(); });
+
+  // Import — dropzone
+  dropzone.addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", e => { handleFiles(e.target.files); fileInput.value = ""; });
+  ["dragenter","dragover"].forEach(ev => dropzone.addEventListener(ev, e => {
+    e.preventDefault(); e.stopPropagation(); dropzone.classList.add("drag");
+  }));
+  ["dragleave","drop"].forEach(ev => dropzone.addEventListener(ev, e => {
+    e.preventDefault(); e.stopPropagation(); dropzone.classList.remove("drag");
+  }));
+  dropzone.addEventListener("drop", e => {
+    if (e.dataTransfer && e.dataTransfer.files) handleFiles(e.dataTransfer.files);
+  });
+
+  // ── Init ────────────────────────────────────────────────────────────────
+  renderLockUI();
+  if (chatHistory.length === 0) {
+    addBotMessage("Hey! I'm Midget jr. 🧠\n\nUse the tabs above to switch modes:\n• 💬 Chat — talk to me, I answer using AI + my knowledge base\n• 🔍 Query — search raw entries in the knowledge base\n• 🌐 Research — fetch & save new info from the web\n• 💻 Code — generate code in any language\n• 📂 Import — upload files to grow my brain (admin)\n• 📋 Queue — topics scheduled for auto-research every 6 hours");
+  } else {
+    // Replay last few turns so refresh isn't an amnesia event
+    chatHistory.slice(-6).forEach(m => {
+      if (m.role === "user") addUserMessage(m.content);
+      else addBotMessage(m.content);
+    });
+  }
+})();
+</script>
+</body>
+</html>
