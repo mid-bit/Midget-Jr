@@ -135,7 +135,7 @@ Save → service auto-redeploys.
 
 What you have:
 - ✅ Your own bot, your data, your keys
-- ✅ Free LLM (Gemini 2.0 Flash — 1,500 calls/day = plenty)
+- ✅ Free LLM (Gemini 2.5 Flash — generous free tier)
 - ✅ Auto-research every 6 hours, only fires on pending queue items
 - ✅ Password-protected admin actions
 - ✅ Always-on (Koyeb free tier doesn't sleep)
@@ -168,3 +168,60 @@ If you'd rather run it on your own computer with Ollama (no API key, no cloud, n
 - **Vercel free:** 100 GB bandwidth/mo — way more than a personal bot will use.
 
 If you ever bump against a free limit, the upgrade is opt-in. No surprise charges.
+
+---
+
+# Backup Path: Hugging Face Spaces (if Koyeb / Render get weird)
+
+Hugging Face Spaces is genuinely free with **no credit card** and is much less likely to demand one. Tradeoff: URL is `huggingface.co/spaces/<your-name>/<space-name>` rather than a custom domain, and Spaces sleep after 48 hours of zero traffic (wake on first request, ~15s cold start).
+
+### Step 1 — Create a HF account
+1. Go to <https://huggingface.co/join>
+2. Sign up (email or GitHub login). No card.
+
+### Step 2 — Create a Docker Space
+1. Go to <https://huggingface.co/new-space>
+2. Owner: your username. Space name: `midgetjr-backend`. License: MIT.
+3. **Space SDK:** select **"Docker"** → **"Blank"** template.
+4. Visibility: Public or Private (both free for personal accounts).
+5. Click **"Create Space"**.
+
+### Step 3 — Upload your backend code
+**Option A — Upload (easiest):**
+1. On the Space's page → **"Files" tab → "Add file" → "Upload files"**.
+2. Upload everything from your local `/backend/` folder (including `Dockerfile`, `server.py`, `requirements.txt`, and the `README.md` I just created).
+3. The Space auto-builds on push.
+
+**Option B — Push from terminal:**
+```bash
+git clone https://huggingface.co/spaces/<your-name>/midgetjr-backend hf-space
+cp -r /path/to/Midget-Jr/backend/* hf-space/
+cd hf-space && git add . && git commit -m "Add backend" && git push
+```
+
+### Step 4 — Set Secrets
+On the Space page → **Settings → Variables and secrets** → add each as **Secret**:
+
+| Key | Value |
+|---|---|
+| `MONGO_URL` | Your MongoDB Atlas connection string |
+| `DB_NAME` | `midgetjr_db` |
+| `JWT_SECRET` | Any random string |
+| `ADMIN_PASSWORD` | `MidgetsRcool` |
+| `LLM_PROVIDER` | `gemini` |
+| `GEMINI_API_KEY` | Your Gemini key |
+| `GEMINI_MODEL` | `gemini-2.5-flash` |
+| `CORS_ORIGINS` | `*` |
+
+### Step 5 — Wait for build, grab URL
+1. Space rebuilds (~2-5 min). Watch "Logs" tab.
+2. When status shows "Running", URL is `https://<your-name>-midgetjr-backend.hf.space`.
+3. Test: `https://<that-url>/api/` should return JSON.
+
+### Step 6 — Plug into Vercel
+Same as before: set `REACT_APP_BACKEND_URL` in Vercel to your HF Space URL, redeploy.
+
+### HF Spaces caveats
+- **Sleep:** After 48h of zero traffic, Space pauses. Next request wakes it (~15s).
+- **Public logs:** Logs are visible on the Space's page. Don't print secrets.
+- **Resources:** 16GB RAM, 2 vCPU free. Way more than needed.
