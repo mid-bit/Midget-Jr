@@ -49,6 +49,9 @@ db = client[DB_NAME]
 kb = db.knowledge_entries
 queue = db.research_queue
 config = db.app_config
+shares = db.shares
+chats = db.chat_messages
+qlog = db.question_log
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 log = logging.getLogger("midgetjr")
@@ -68,6 +71,16 @@ class UnlockBody(BaseModel):
 class ChatBody(BaseModel):
     message: str
     history: List[dict] = Field(default_factory=list)
+    session_id: Optional[str] = None
+    username: Optional[str] = None
+
+
+class ShareBody(BaseModel):
+    question: str
+    answer: str
+    mode: str = "chat"
+    context_used: int = 0
+    username: Optional[str] = None
 
 
 class QueryBody(BaseModel):
@@ -377,7 +390,139 @@ async def chat(body: ChatBody):
         reply = await llm_chat(messages)
     except Exception as e:
         raise HTTPException(502, f"LLM error: {e}")
+
+    # Fire-and-forget side effects: persist chat + track question for auto-promotion.
+    asyncio.create_task(_log_exchange(body.session_id, body.username, body.message, reply, len(ctx_docs)))
+    asyncio.create_task(_maybe_auto_promote(body.message))
+
     return {"reply": reply, "context_used": len(ctx_docs)}
+
+
+def _clean_username(u: Optional[str]) -> str:
+    """Trim, dedupe whitespace, cap length, fall back to 'guest'."""
+    if not u:
+        return "guest"
+    u = re.sub(r"\s+", " ", str(u)).strip()
+    u = re.sub(r"[^\w \-_.]", "", u)  # safe chars only
+    return (u[:40] or "guest")
+
+
+async def _log_exchange(session_id: Optional[str], username: Optional[str],
+                         user_msg: str, bot_reply: str, ctx: int) -> None:
+    """Persist a chat exchange in MongoDB for cross-device history + admin oversight."""
+    try:
+        await chats.insert_one(dict({
+            "id": str(uuid.uuid4()),
+            "session_id": session_id or None,
+            "username": _clean_username(username),
+            "user_message": user_msg[:2000],
+            "bot_reply": bot_reply[:4000],
+            "context_used": ctx,
+            "created_at": _now(),
+        }))
+    except Exception as e:
+        log.warning(f"chat log failed: {e}")
+
+
+def _question_keyset(q: str) -> List[str]:
+    """Return up to 4 distinctive tokens (sorted) used as the question's fingerprint."""
+    toks = re.findall(r"[A-Za-z0-9]{4,}", q.lower())
+    stop = {"what", "when", "where", "which", "while", "with", "have", "this", "that",
+            "the", "and", "for", "you", "your", "are", "from", "tell", "about", "does",
+            "did", "into", "they", "them", "how", "why", "who", "can", "should", "is",
+            "in", "of", "on", "to", "a", "an", "be", "or"}
+    keep = sorted({t for t in toks if t not in stop})
+    return keep[:4]
+
+
+async def _maybe_auto_promote(user_msg: str) -> None:
+    """Count similar-keyword questions; queue a research topic when >=3 are seen."""
+    keys = _question_keyset(user_msg)
+    if not keys:
+        return
+    key = " ".join(keys)
+    try:
+        doc = await qlog.find_one_and_update(
+            {"_id": key},
+            {"$inc": {"count": 1},
+             "$set": {"last_seen": _now()},
+             "$setOnInsert": {"first_seen": _now(), "sample_question": user_msg[:300], "promoted": False}},
+            upsert=True,
+            return_document=True,
+        )
+        if not doc or doc.get("promoted"):
+            return
+        if doc.get("count", 0) >= 3:
+            topic = doc.get("sample_question") or user_msg
+            # avoid duplicate queue items
+            already = await queue.find_one({"topic": topic, "status": {"$in": ["pending", "running", "done"]}})
+            if not already:
+                await queue.insert_one(dict({
+                    "id": str(uuid.uuid4()),
+                    "topic": topic[:200],
+                    "category": "General",
+                    "priority": 1,
+                    "status": "pending",
+                    "added_by": "auto",
+                    "created_at": _now(),
+                    "last_attempt": None,
+                    "error": None,
+                }))
+                log.info(f"Auto-promoted topic to research queue: {topic[:80]!r}")
+            await qlog.update_one({"_id": key}, {"$set": {"promoted": True}})
+    except Exception as e:
+        log.warning(f"auto-promote failed: {e}")
+
+
+@api.get("/chat/history/{session_id}")
+async def chat_history(session_id: str, limit: int = 200):
+    """Return persisted chat exchanges for a given session_id (cross-device)."""
+    if not session_id or len(session_id) > 80:
+        raise HTTPException(400, "Bad session_id")
+    cursor = chats.find({"session_id": session_id}, {"_id": 0}).sort("created_at", -1).limit(min(limit, 500))
+    docs = await cursor.to_list(length=limit)
+    docs.reverse()  # chronological order
+    return {"messages": docs, "count": len(docs)}
+
+
+# ── Shares ─────────────────────────────────────────────────────────────
+def _short_id(n: int = 8) -> str:
+    import secrets
+    import string
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(n))
+
+
+@api.post("/share")
+async def create_share(body: ShareBody):
+    """Anyone can pin a Q/A pair — returns a short id used in ?share= URLs."""
+    sid = _short_id()
+    # collision-safe loop
+    for _ in range(3):
+        if not await shares.find_one({"id": sid}):
+            break
+        sid = _short_id()
+    doc = {
+        "id": sid,
+        "question": body.question[:2000],
+        "answer": body.answer[:8000],
+        "mode": body.mode[:20] if body.mode else "chat",
+        "context_used": int(body.context_used or 0),
+        "username": _clean_username(body.username),
+        "created_at": _now(),
+    }
+    await shares.insert_one(dict(doc))
+    return {"id": sid}
+
+
+@api.get("/share/{share_id}")
+async def get_share(share_id: str):
+    if not re.fullmatch(r"[a-z0-9]{4,16}", share_id or ""):
+        raise HTTPException(404, "Not found")
+    doc = await shares.find_one({"id": share_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Not found")
+    return doc
 
 
 @api.post("/query")
@@ -460,6 +605,41 @@ async def delete_kb(entry_id: str):
     return {"deleted": entry_id}
 
 
+# ── Admin oversight endpoints ───────────────────────────────────────────
+@api.get("/admin/chat-log", dependencies=[Depends(require_admin)])
+async def admin_chat_log(limit: int = 200, username: Optional[str] = None):
+    """Paginated reverse-chronological feed of every visitor question+answer."""
+    q = {}
+    if username:
+        q["username"] = _clean_username(username)
+    cursor = chats.find(q, {"_id": 0}).sort("created_at", -1).limit(min(max(limit, 1), 500))
+    docs = await cursor.to_list(length=limit)
+    return {"messages": docs, "count": len(docs)}
+
+
+@api.get("/admin/visitors", dependencies=[Depends(require_admin)])
+async def admin_visitors():
+    """Aggregate visitors with their question count and last-seen timestamp."""
+    pipeline = [
+        {"$group": {
+            "_id": "$username",
+            "count": {"$sum": 1},
+            "last_seen": {"$max": "$created_at"},
+            "first_seen": {"$min": "$created_at"},
+        }},
+        {"$sort": {"last_seen": -1}},
+        {"$limit": 200},
+    ]
+    docs = await chats.aggregate(pipeline).to_list(length=200)
+    visitors = [{
+        "username": d["_id"] or "guest",
+        "count": d["count"],
+        "last_seen": d["last_seen"],
+        "first_seen": d["first_seen"],
+    } for d in docs]
+    return {"visitors": visitors, "count": len(visitors)}
+
+
 @api.get("/queue")
 async def list_queue():
     docs = await queue.find({}, {"_id": 0}).sort("created_at", -1).limit(200).to_list(200)
@@ -533,6 +713,10 @@ async def on_startup():
     await kb.create_index("id", unique=True)
     await kb.create_index([("topic", "text"), ("summary", "text"), ("content", "text")])
     await queue.create_index("id", unique=True)
+    await shares.create_index("id", unique=True)
+    await chats.create_index("session_id")
+    await chats.create_index("created_at")
+    await qlog.create_index("count")
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(process_queue, "interval", hours=6, id="auto_research",
                       next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2))

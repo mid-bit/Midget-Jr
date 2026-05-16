@@ -46,12 +46,25 @@ code, pre, .mono { font-family: 'Geist Mono', 'Fira Code', monospace; }
 #lock-toggle.unlocked { color: var(--green); border-color: #a6e3a155; }
 
 #history-btn {
-  margin-left: auto; background: var(--panel); color: var(--text);
+  background: var(--panel); color: var(--text);
   border: 1px solid var(--border); border-radius: 20px; padding: 6px 12px;
   font-size: 12px; cursor: pointer; font-family: inherit;
   display: inline-flex; align-items: center; gap: 6px; transition: all .2s;
 }
 #history-btn:hover { border-color: var(--purple); color: var(--purple); }
+#username-btn, #install-btn {
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 20px; padding: 6px 12px;
+  font-size: 12px; cursor: pointer; font-family: inherit;
+  display: inline-flex; align-items: center; gap: 6px; transition: all .2s;
+  max-width: 160px; overflow: hidden;
+}
+#username-btn:hover { border-color: var(--orange); color: var(--orange); }
+#username-btn span:nth-child(2) { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 110px; }
+#install-btn { color: var(--green); border-color: #a6e3a155; }
+#install-btn:hover { background: #a6e3a111; }
+#history-btn { margin-left: auto; }
+#username-btn, #install-btn { margin-left: 0; }
 #lock-toggle { margin-left: 0; }
 
 #tabs { padding: 12px 24px 0; display: flex; gap: 6px; flex-wrap: wrap; flex-shrink: 0; }
@@ -67,6 +80,13 @@ code, pre, .mono { font-family: 'Geist Mono', 'Fira Code', monospace; }
 .tab.active-code     { background: var(--purple); color: var(--panel); border-color: var(--purple); }
 .tab.active-import   { background: var(--orange); color: var(--panel); border-color: var(--orange); }
 .tab.active-queue    { background: var(--yellow); color: var(--panel); border-color: var(--yellow); }
+.tab.active-manage   { background: #f5c2e7;       color: var(--panel); border-color: #f5c2e7; }
+.tab.active-visitors { background: var(--teal);   color: var(--panel); border-color: var(--teal); }
+.tab.admin-tab { border-style: dashed; }
+.tab.admin-tab.active-import,
+.tab.admin-tab.active-queue,
+.tab.admin-tab.active-manage,
+.tab.admin-tab.active-visitors { border-style: solid; }
 
 #lang-select {
   background: var(--panel); color: var(--text);
@@ -263,3 +283,105 @@ pre.code-block {
   .side-panel { padding: 0 14px 80px; }
   #lock-toggle { padding: 5px 10px; font-size: 11.5px; }
 }
+
+/* ── Share button on bot bubbles ───────────────────────────────────── */
+.share-link-btn {
+  display: inline-block; margin-top: 8px; margin-right: 6px;
+  background: transparent; color: var(--teal);
+  border: 1px solid #74c7ec55; border-radius: 14px;
+  padding: 3px 10px; font-size: 11px; font-family: inherit;
+  cursor: pointer; transition: all .2s;
+}
+.share-link-btn:hover { background: #74c7ec22; border-color: var(--teal); }
+
+/* ── History modal: source tabs ────────────────────────────────────── */
+.history-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+.htab {
+  background: var(--panel-2); color: var(--muted);
+  border: 1px solid var(--border); border-radius: 14px;
+  padding: 4px 12px; font-size: 11px; cursor: pointer; font-family: inherit;
+  transition: all .15s;
+}
+.htab:hover { color: var(--text); }
+.htab.active { background: var(--purple); color: var(--panel); border-color: var(--purple); }
+
+/* ── KB Manage items ───────────────────────────────────────────────── */
+.kb-item {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 12px; padding: 11px 13px; margin-bottom: 7px;
+  display: flex; align-items: flex-start; gap: 10px; animation: fadeIn .2s ease;
+}
+.kb-topic { color: var(--text); font-weight: 600; font-size: 13.5px; word-break: break-word; }
+.kb-summary { color: var(--sub); font-size: 12px; margin-top: 3px; line-height: 1.4; word-break: break-word; }
+
+/* ── Visitors panel ────────────────────────────────────────────────── */
+.visitor-grid { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.visitor-pill {
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border-2); border-radius: 16px;
+  padding: 6px 12px; font-size: 12px; cursor: pointer; font-family: inherit;
+  display: inline-flex; align-items: center; gap: 8px; transition: all .15s;
+}
+.visitor-pill:hover { border-color: var(--teal); }
+.visitor-pill.active { background: var(--teal); color: var(--panel); border-color: var(--teal); }
+.visitor-pill.clear { color: var(--pink); border-color: #f38ba855; }
+.vp-count {
+  background: var(--border); color: var(--text); border-radius: 10px;
+  padding: 1px 8px; font-size: 10px; font-family: 'Geist Mono', monospace;
+}
+.visitor-pill.active .vp-count { background: rgba(0,0,0,.25); color: var(--panel); }
+
+.chatlog-item {
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 10px; padding: 10px 12px; margin-bottom: 7px;
+  animation: fadeIn .2s ease;
+}
+.chatlog-head {
+  display: flex; justify-content: space-between; gap: 8px;
+  font-size: 10.5px; color: var(--muted); margin-bottom: 6px;
+  font-family: 'Geist Mono', monospace;
+}
+.chatlog-user { color: var(--blue); font-weight: 600; }
+.chatlog-q {
+  color: var(--text); font-size: 12.5px; line-height: 1.45;
+  padding: 4px 0; word-break: break-word; white-space: pre-wrap;
+}
+.chatlog-a {
+  color: var(--sub); font-size: 12px; line-height: 1.5;
+  padding-top: 6px; margin-top: 6px; border-top: 1px dashed var(--border);
+  word-break: break-word; white-space: pre-wrap;
+  max-height: 130px; overflow-y: auto;
+}
+
+/* ── Share Viewer (public read-only page) ──────────────────────────── */
+.share-viewer { max-width: 720px; padding: 28px 24px; }
+.share-header {
+  display: flex; align-items: center; gap: 12px; margin-bottom: 22px;
+}
+.share-header h1 { font-size: 18px; font-weight: 700; }
+.share-header p { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.share-header .avatar {
+  width: 44px; height: 44px; border-radius: 14px;
+  background: linear-gradient(135deg, var(--blue), var(--purple));
+  display: flex; align-items: center; justify-content: center; font-size: 22px;
+}
+.share-card {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 16px; padding: 20px;
+}
+.share-card.empty { text-align: center; }
+.share-q, .share-a { padding: 12px 0; }
+.share-a { border-top: 1px dashed var(--border); margin-top: 4px; }
+.share-tag {
+  display: inline-block; font-size: 10px; letter-spacing: 1.5px; text-transform: uppercase;
+  color: var(--muted); margin-bottom: 6px; font-family: 'Geist Mono', monospace;
+}
+.share-q p { color: var(--text); font-size: 14px; font-weight: 500; line-height: 1.5; }
+.share-a p { color: var(--text); font-size: 13.5px; line-height: 1.65; }
+.share-meta {
+  margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border);
+  font-size: 10.5px; color: var(--muted); font-family: 'Geist Mono', monospace;
+}
+
+/* ── Modal generic input width ─────────────────────────────────────── */
+.modal input[readonly] { font-family: 'Geist Mono', monospace; font-size: 11.5px; }
