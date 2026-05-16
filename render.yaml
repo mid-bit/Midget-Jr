@@ -1,0 +1,30 @@
+# Render free-tier config (alternative to Koyeb).
+# To use: push repo to GitHub, click "New Blueprint" on Render, point at this file.
+services:
+  - type: web
+    name: midgetjr-backend
+    runtime: docker
+    plan: free
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    envVars:
+      - key: MONGO_URL
+        sync: false   # paste your MongoDB Atlas SRV connection string in the Render UI
+      - key: DB_NAME
+        value: midgetjr_db
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_PASSWORD
+        value: MidgetsRcool
+      - key: LLM_PROVIDER
+        value: gemini
+      - key: GEMINI_API_KEY
+        sync: false   # paste in Render UI — never commit
+      - key: GEMINI_MODEL
+        value: gemini-2.0-flash
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: llama-3.1-8b-instant
+      - key: CORS_ORIGINS
+        value: "*"     # tighten to your Vercel domain in prod

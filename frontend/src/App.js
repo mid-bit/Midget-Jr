@@ -65,7 +65,9 @@ function PasswordModal({ label, onClose, onUnlock }) {
       setToken(r.token);
       onUnlock();
     } catch (e) {
-      setErr(e.message || "Wrong password");
+      // /api/unlock only fails on bad password; show a friendly message regardless of the raw error.
+      const msg = (e && e.message) || "";
+      setErr(/wrong password/i.test(msg) ? msg : "Wrong password");
       inputRef.current?.select();
     }
   };

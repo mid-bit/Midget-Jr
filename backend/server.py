@@ -1,4 +1,8 @@
-"""Midget jr. backend — FastAPI + MongoDB + GPT-5.2 (via Emergent LLM key)."""
+"""Midget jr. backend — FastAPI + MongoDB + free LLM (Gemini or Groq).
+
+Provider-agnostic: uses the OpenAI Python client against Gemini's or Groq's
+OpenAI-compatible endpoints. Switch via LLM_PROVIDER env (gemini | groq).
+"""
 from __future__ import annotations
 
 import asyncio
@@ -18,10 +22,9 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
 from motor.motor_asyncio import AsyncIOMotorClient
+from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 from starlette.middleware.cors import CORSMiddleware
-
-from emergentintegrations.llm.chat import LlmChat, UserMessage
 
 # ── Setup ────────────────────────────────────────────────────────────────
 ROOT_DIR = Path(__file__).parent
@@ -29,11 +32,17 @@ load_dotenv(ROOT_DIR / ".env")
 
 MONGO_URL = os.environ["MONGO_URL"]
 DB_NAME = os.environ["DB_NAME"]
-EMERGENT_LLM_KEY = os.environ["EMERGENT_LLM_KEY"]
 JWT_SECRET = os.environ["JWT_SECRET"]
 ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-5.2")
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai")
+
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "gemini").lower()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
+GROQ_BASE = "https://api.groq.com/openai/v1"
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
@@ -155,17 +164,43 @@ async def require_admin(authorization: Optional[str] = Header(None)) -> bool:
 
 
 # ── LLM helpers ──────────────────────────────────────────────────────────
-def new_chat(session_id: str, system: str) -> LlmChat:
-    return LlmChat(
-        api_key=EMERGENT_LLM_KEY,
-        session_id=session_id,
-        system_message=system,
-    ).with_model(LLM_PROVIDER, LLM_MODEL)
+def _llm_config() -> tuple[str, str, str]:
+    """Return (api_key, base_url, model) for the configured provider."""
+    if LLM_PROVIDER == "gemini":
+        if not GEMINI_API_KEY:
+            raise RuntimeError(
+                "GEMINI_API_KEY is empty. Grab one free at https://aistudio.google.com/apikey "
+                "and add it to /app/backend/.env (no credit card needed)."
+            )
+        return GEMINI_API_KEY, GEMINI_BASE, GEMINI_MODEL
+    if LLM_PROVIDER == "groq":
+        if not GROQ_API_KEY:
+            raise RuntimeError(
+                "GROQ_API_KEY is empty. Grab one free at https://console.groq.com/keys "
+                "and add it to /app/backend/.env (no credit card needed)."
+            )
+        return GROQ_API_KEY, GROQ_BASE, GROQ_MODEL
+    raise RuntimeError(f"Unknown LLM_PROVIDER '{LLM_PROVIDER}' — use 'gemini' or 'groq'.")
+
+
+def llm_client() -> tuple[AsyncOpenAI, str]:
+    api_key, base_url, model = _llm_config()
+    return AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=60.0), model
+
+
+async def llm_chat(messages: List[dict], temperature: float = 0.7) -> str:
+    client, model = llm_client()
+    r = await client.chat.completions.create(
+        model=model, messages=messages, temperature=temperature
+    )
+    return (r.choices[0].message.content or "").strip()
 
 
 async def llm_oneshot(system: str, prompt: str) -> str:
-    chat = new_chat(f"oneshot-{uuid.uuid4().hex[:8]}", system)
-    return await chat.send_message(UserMessage(text=prompt))
+    return await llm_chat([
+        {"role": "system", "content": system},
+        {"role": "user", "content": prompt},
+    ])
 
 
 # ── Knowledge search ─────────────────────────────────────────────────────
@@ -288,7 +323,15 @@ async def do_research(topic: str, category: str = "General") -> dict:
 # ── Routes: Public ───────────────────────────────────────────────────────
 @api.get("/")
 async def root():
-    return {"app": "Midget jr.", "ok": True, "model": LLM_MODEL}
+    model = GEMINI_MODEL if LLM_PROVIDER == "gemini" else GROQ_MODEL
+    key_ok = bool(GEMINI_API_KEY if LLM_PROVIDER == "gemini" else GROQ_API_KEY)
+    return {
+        "app": "Midget jr.",
+        "ok": True,
+        "provider": LLM_PROVIDER,
+        "model": model,
+        "key_configured": key_ok,
+    }
 
 
 @api.post("/unlock")
@@ -319,31 +362,19 @@ async def chat(body: ChatBody):
         "Answer concisely. If knowledge base context is provided, prefer it; "
         "cite entries like [1], [2]. If you don't know, say so."
     )
-    session_id = "chat-session"
-    llm = new_chat(session_id, system + ("\n\n" + context_block if context_block else ""))
+    if context_block:
+        system += "\n\n" + context_block
 
-    # Replay short history so multi-turn works without persisting on the LLM side
+    messages: list[dict] = [{"role": "system", "content": system}]
     for m in (body.history or [])[-10:]:
         role = m.get("role")
         text = (m.get("content") or "").strip()
         if role in ("user", "assistant") and text:
-            # Send each prior user message; the lib only takes user messages, so we
-            # fold prior assistant replies into the user prompt as light context.
-            pass
-
-    # Build a single prompt with light recap (LlmChat manages its own history per session)
-    if body.history:
-        recap_lines = []
-        for m in body.history[-6:]:
-            who = "User" if m.get("role") == "user" else "Assistant"
-            recap_lines.append(f"{who}: {(m.get('content') or '').strip()[:400]}")
-        recap = "Recent conversation:\n" + "\n".join(recap_lines) + "\n\nNew user message:\n"
-        user_text = recap + body.message
-    else:
-        user_text = body.message
+            messages.append({"role": role, "content": text[:2000]})
+    messages.append({"role": "user", "content": body.message})
 
     try:
-        reply = await llm.send_message(UserMessage(text=user_text))
+        reply = await llm_chat(messages)
     except Exception as e:
         raise HTTPException(502, f"LLM error: {e}")
     return {"reply": reply, "context_used": len(ctx_docs)}
@@ -506,7 +537,7 @@ async def on_startup():
     scheduler.add_job(process_queue, "interval", hours=6, id="auto_research",
                       next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2))
     scheduler.start()
-    log.info("Midget jr. backend up. Auto-research every 6h.")
+    log.info(f"Midget jr. backend up. Provider={LLM_PROVIDER}. Auto-research every 6h.")
 
 
 @app.on_event("shutdown")
