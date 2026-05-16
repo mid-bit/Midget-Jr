@@ -85,7 +85,7 @@ If your repo isn't on GitHub yet, in the Emergent chat input, hit **"Save to Git
    | `ADMIN_PASSWORD` | `MidgetsRcool` |
    | `LLM_PROVIDER` | `gemini` |
    | `GEMINI_API_KEY` | (your Gemini key from Step 1) |
-   | `GEMINI_MODEL` | `gemini-2.0-flash` |
+   | `GEMINI_MODEL` | `gemini-2.5-flash` |
    | `GROQ_API_KEY` | (your Groq key, optional) |
    | `GROQ_MODEL` | `llama-3.1-8b-instant` |
    | `CORS_ORIGINS` | `*` (tighten later to your Vercel domain) |
