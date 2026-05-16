@@ -385,3 +385,67 @@ pre.code-block {
 
 /* ── Modal generic input width ─────────────────────────────────────── */
 .modal input[readonly] { font-family: 'Geist Mono', monospace; font-size: 11.5px; }
+
+/* ── Welcome banner (shown once on load, dismissible) ──────────────── */
+.welcome-banner {
+  margin: 12px 24px 0;
+  background: linear-gradient(135deg, #89b4fa18, #cba6f718);
+  border: 1px solid #89b4fa44;
+  border-radius: 14px;
+  padding: 14px 18px;
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  animation: fadeIn .3s ease;
+}
+.welcome-body { flex: 1; min-width: 0; }
+.welcome-title {
+  font-size: 14.5px; font-weight: 700; color: var(--text);
+  letter-spacing: -0.005em;
+}
+.welcome-text {
+  font-size: 12px; color: var(--sub); line-height: 1.55; margin-top: 5px;
+}
+.welcome-sub {
+  display: inline-block; margin-top: 6px;
+  color: var(--muted); font-size: 11px;
+}
+.welcome-close {
+  flex-shrink: 0; background: transparent; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 50%;
+  width: 26px; height: 26px; cursor: pointer; font-size: 13px;
+  font-family: inherit; display: flex; align-items: center; justify-content: center;
+  transition: all .15s;
+}
+.welcome-close:hover { color: var(--pink); border-color: var(--pink); }
+
+/* ── Per-tab intro line ────────────────────────────────────────────── */
+.tab-intro {
+  display: flex; gap: 10px; align-items: flex-start;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 14px;
+  font-size: 12.5px; color: var(--sub); line-height: 1.5;
+  margin-bottom: 14px;
+  animation: fadeIn .2s ease;
+}
+.tab-intro-pill {
+  flex-shrink: 0;
+  background: var(--panel);
+  border: 1px solid var(--border-2);
+  border-radius: 8px;
+  width: 28px; height: 28px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px;
+}
+.empty-conversation {
+  text-align: center; color: var(--muted); font-size: 12.5px;
+  padding: 30px 0; font-style: italic;
+}
+
+@media (max-width: 560px) {
+  .welcome-banner { margin: 10px 14px 0; padding: 11px 13px; gap: 10px; }
+  .welcome-title { font-size: 13.5px; }
+  .welcome-text { font-size: 11.5px; }
+}

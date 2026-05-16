@@ -46,6 +46,19 @@ const MODE_PLACEHOLDERS = {
   code: "Describe the code you need... (try: 'an HTML page with a counter button')",
 };
 
+const MODE_INTROS = {
+  chat: "Ask anything in plain English. I'll answer with my AI brain plus anything I've learned in my knowledge base. Watch for the 📚 badge — it means I used a saved entry.",
+  query: "Search what's already in my brain. This doesn't use AI or hit the web — it's a fast lookup over imported files and past research. Type a keyword to find matching entries.",
+  research: "Give me a topic and I'll Google it, scrape the top sources, write a summary with citations, and save it to my brain forever. Anyone using this site helps me grow.",
+  code: "Describe what you want, pick a language, I'll write it. Hit ⬇ Download to save it as a real file. Try 'an HTML page with a counter' or 'a Python script that renames files'.",
+  import: "Drop in text-based files (.md, .txt, .json, .py, .html …) and I'll absorb them into my brain. Use this to teach me about your projects, notes, or anything I should remember.",
+  manage: "Browse, search, and delete the entries inside my brain. Each came from Research, Import, or auto-research. Removing one means I'll forget it.",
+  queue: "Topics scheduled for me to research automatically every 6 hours. Auto-promoted entries (🤖) appear when 3+ visitors ask similar questions — I notice patterns and dig in on my own.",
+  visitors: "See who's been chatting with me. Click any name to filter the question log. This is your audit trail of what visitors are asking.",
+};
+
+const WELCOME_DISMISS_KEY = "mj_welcome_dismissed";
+
 const LANGS = ["python","javascript","typescript","java","c++","go","rust","sql","bash","html","css","json","markdown"];
 const CATEGORIES = ["General","Science","Technology","History","Math","Health","Philosophy","Art"];
 const ACCEPT = ".txt,.md,.markdown,.json,.csv,.log,.yaml,.yml,.xml,.html,.htm,.css,.js,.mjs,.ts,.tsx,.jsx,.py,.go,.rs,.java,.cpp,.cc,.c,.h,.hpp,.sh,.bash,.sql,.toml,.ini,.conf,.rb,.php,.swift,.kt";
@@ -414,7 +427,14 @@ function MainApp() {
   const [mode, setMode] = useState("chat");
   const [lang, setLang] = useState("python");
   const [text, setText] = useState("");
-  const [messages, setMessages] = useState([]);
+  // Per-mode message streams — each tab keeps its own conversation
+  const [messagesByMode, setMessagesByMode] = useState({
+    chat: [], query: [], research: [], code: [],
+  });
+  const messages = useMemo(() => messagesByMode[mode] || [], [messagesByMode, mode]);
+  const [welcomeDismissed, setWelcomeDismissed] = useState(
+    () => localStorage.getItem(WELCOME_DISMISS_KEY) === "1"
+  );
   const [history, setHistory] = useState(() => loadJSON(HISTORY_KEY, []));
   const [typing, setTyping] = useState(false);
   const [unlocked, setUnlocked] = useState(!!getToken());
@@ -453,20 +473,7 @@ function MainApp() {
   const messagesEnd = useRef(null);
   const taRef = useRef(null);
 
-  // Welcome on every load (no replay)
-  useEffect(() => {
-    if (messages.length === 0) {
-      const archived = loadJSON(ARCHIVE_KEY, []).length;
-      const visitorHint = "\n\n🔗 Share this link with anyone — they can chat, query, and trigger research (the bot grows from every research call). Only the admin can import files or manage the queue.";
-      const historyHint = archived > 0 ? `\n\n📜 ${archived} past message${archived===1?"":"s"} saved on this device — tap History to browse them.` : "";
-      setMessages([{
-        role: "bot",
-        content: "Hey! I'm Midget jr. 🧠\n\nUse the tabs above to switch modes:\n• 💬 Chat — talk to me, I answer using AI + my knowledge base\n• 🔍 Query — search raw entries in the knowledge base\n• 🌐 Research — fetch & save new info from Google\n• 💻 Code — generate code in any language (downloadable)\n• 📂 Import — upload files to grow my brain (admin)\n• 🗂 Manage — view/delete knowledge entries (admin)\n• 📋 Queue — topics scheduled for auto-research every 6 hours\n• 👥 Visitors — see who's chatted with me (admin)" + visitorHint + historyHint
-      }]);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
+  // Auto-scroll the active conversation when it changes
   useEffect(() => { messagesEnd.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, typing]);
 
   // tab-driven loaders
@@ -495,8 +502,10 @@ function MainApp() {
 
   const accent = MODE_COLORS[mode];
 
-  const pushBot = (b) => setMessages(m => [...m, { role: "bot", ...b }]);
-  const pushUser = (t) => setMessages(m => [...m, { role: "user", content: t, username }]);
+  // Push helpers that write to the *current* mode's bucket
+  const pushBot = (b) => setMessagesByMode(s => ({ ...s, [mode]: [...(s[mode]||[]), { role: "bot", ...b }] }));
+  const pushUser = (t) => setMessagesByMode(s => ({ ...s, [mode]: [...(s[mode]||[]), { role: "user", content: t, username }] }));
+  const pushBotIn = (m, b) => setMessagesByMode(s => ({ ...s, [m]: [...(s[m]||[]), { role: "bot", ...b }] }));
 
   const archive = (entries) => {
     const a = loadJSON(ARCHIVE_KEY, []);
@@ -517,7 +526,7 @@ function MainApp() {
     try {
       if (mode === "chat") {
         const r = await api("/chat", { method: "POST", body: { message: t, history, session_id: sessionId, username } });
-        setMessages(m => [...m, { role: "bot", content: r.reply, ctx: r.context_used, lastUserQuestion: t, mode: "chat" }]);
+        pushBotIn("chat", { content: r.reply, ctx: r.context_used, lastUserQuestion: t, mode: "chat" });
         archiveBuf.push({ role: "bot", content: r.reply, mode, at: new Date().toISOString() });
         const h2 = [...history, { role: "user", content: t }, { role: "assistant", content: r.reply }];
         while (h2.length > 12) h2.splice(0, 2);
@@ -726,6 +735,22 @@ function MainApp() {
         </button>
       </div>
 
+      {!welcomeDismissed && (
+        <div className="welcome-banner" data-testid="welcome-banner">
+          <div className="welcome-body">
+            <div className="welcome-title">Hey! I'm Midget jr. 🧠</div>
+            <div className="welcome-text">
+              I'm a self-growing knowledge bot. Use the tabs below to switch what I do — chat, query, research the web, or generate code. The more people use me, the more I learn.<br/>
+              <span className="welcome-sub">🔗 Share this link with anyone — they can chat and help me grow. Only the admin can import files or manage my brain.</span>
+            </div>
+          </div>
+          <button className="welcome-close"
+            onClick={() => { localStorage.setItem(WELCOME_DISMISS_KEY, "1"); setWelcomeDismissed(true); }}
+            data-testid="welcome-dismiss"
+            title="Dismiss">✕</button>
+        </div>
+      )}
+
       <div id="tabs">
         {["chat","query","research","code"].map(m => (
           <button key={m} className={"tab" + (mode === m ? ` active-${m}` : "")} onClick={()=>setMode(m)} data-testid={`tab-${m}`}>
@@ -748,6 +773,13 @@ function MainApp() {
 
       {!["queue","import","manage","visitors"].includes(mode) && (
         <div id="messages" data-testid="messages">
+          <div className="tab-intro" data-testid={`intro-${mode}`}>
+            <span className="tab-intro-pill">{ {chat:"💬",query:"🔍",research:"🌐",code:"💻"}[mode] }</span>
+            <span>{MODE_INTROS[mode]}</span>
+          </div>
+          {messages.length === 0 && (
+            <div className="empty-conversation">No {mode} messages yet — go ahead and try one 👇</div>
+          )}
           {messages.map((m, i) => <Bubble key={i} msg={m} onShare={onShareBubble}/>)}
           {typing && <Typing/>}
           <div ref={messagesEnd}/>
@@ -756,6 +788,10 @@ function MainApp() {
 
       {mode === "queue" && (
         <div className="side-panel">
+          <div className="tab-intro" data-testid="intro-queue">
+            <span className="tab-intro-pill">📋</span>
+            <span>{MODE_INTROS.queue}</span>
+          </div>
           <div className="panel-card">
             <h3>➕ Add topic to auto-research queue</h3>
             <div className="row-flex">
@@ -796,6 +832,10 @@ function MainApp() {
 
       {mode === "import" && (
         <div className="side-panel">
+          <div className="tab-intro" data-testid="intro-import">
+            <span className="tab-intro-pill">📂</span>
+            <span>{MODE_INTROS.import}</span>
+          </div>
           <div className="panel-card">
             <h3>📂 Import files into Midget's brain</h3>
             <label className={"dropzone" + (dragOver ? " drag" : "")}
@@ -832,6 +872,10 @@ function MainApp() {
 
       {mode === "manage" && (
         <div className="side-panel">
+          <div className="tab-intro" data-testid="intro-manage">
+            <span className="tab-intro-pill">🗂</span>
+            <span>{MODE_INTROS.manage}</span>
+          </div>
           <div className="panel-card">
             <h3>🗂 Knowledge entries ({kbList.length})</h3>
             <input className="qinput" placeholder="Search by topic / summary / tag..."
@@ -863,6 +907,10 @@ function MainApp() {
 
       {mode === "visitors" && (
         <div className="side-panel">
+          <div className="tab-intro" data-testid="intro-visitors">
+            <span className="tab-intro-pill">👥</span>
+            <span>{MODE_INTROS.visitors}</span>
+          </div>
           <div className="panel-card">
             <h3>👥 Visitors {visitors.length > 0 && `(${visitors.length})`}</h3>
             <div className="visitor-grid">
