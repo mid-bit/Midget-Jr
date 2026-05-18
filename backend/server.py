@@ -53,6 +53,8 @@ config = db.app_config
 shares = db.shares
 chats = db.chat_messages
 qlog = db.question_log
+access_codes = db.access_codes
+bug_reports = db.bug_reports
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 log = logging.getLogger("midgetjr")
@@ -121,6 +123,27 @@ class DirectModeBody(BaseModel):
     enabled: bool
 
 
+class AccessModeBody(BaseModel):
+    enabled: bool
+
+
+class CreateCodeBody(BaseModel):
+    label: Optional[str] = None
+    expires_in_days: Optional[int] = 30
+    max_uses: Optional[int] = None
+
+
+class GuestAuthBody(BaseModel):
+    code: str
+
+
+class BugReportBody(BaseModel):
+    description: str
+    steps: str
+    screenshot: Optional[str] = None   # data URL, max ~500KB
+    username: Optional[str] = None
+
+
 class KnowledgeEntry(BaseModel):
     id: str
     topic: str
@@ -181,6 +204,42 @@ async def require_admin(authorization: Optional[str] = Header(None)) -> bool:
     if payload.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Forbidden")
     return True
+
+
+async def maybe_guest(authorization: Optional[str] = Header(None)) -> dict:
+    """Gate public endpoints behind a code when private-mode is on.
+    Returns the decoded payload or a dummy for open access. Admin tokens pass through."""
+    mode = await config.find_one({"_id": "access_mode"})
+    if not mode or not mode.get("require_guest_pass"):
+        return {"role": "open"}
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Guest access code required")
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired guest token")
+    if payload.get("role") not in ("admin", "guest"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return payload
+
+
+def make_guest_token(code: str, expires_at_iso: Optional[str]) -> str:
+    payload = {
+        "role": "guest",
+        "code": code,
+        "iat": int(datetime.now(timezone.utc).timestamp()),
+    }
+    if expires_at_iso:
+        # mirror code's expiration on the JWT
+        try:
+            exp_dt = datetime.fromisoformat(expires_at_iso.replace("Z", "+00:00"))
+            payload["exp"] = int(exp_dt.timestamp())
+        except Exception:
+            payload["exp"] = int((datetime.now(timezone.utc) + timedelta(days=7)).timestamp())
+    else:
+        payload["exp"] = int((datetime.now(timezone.utc) + timedelta(days=7)).timestamp())
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 
 # ── LLM helpers ──────────────────────────────────────────────────────────
@@ -365,7 +424,7 @@ async def unlock(body: UnlockBody):
 
 
 @api.post("/chat")
-async def chat(body: ChatBody):
+async def chat(body: ChatBody, _guest: dict = Depends(maybe_guest)):
     ctx_docs = await search_kb(body.message, limit=4)
     context_block = ""
     if ctx_docs:
@@ -591,7 +650,7 @@ async def get_share(share_id: str):
 
 
 @api.post("/query")
-async def query_kb(body: QueryBody):
+async def query_kb(body: QueryBody, _guest: dict = Depends(maybe_guest)):
     docs = await search_kb(body.query, limit=10)
     results = []
     for d in docs:
@@ -607,12 +666,12 @@ async def query_kb(body: QueryBody):
 
 
 @api.post("/research")
-async def research(body: ResearchBody):
+async def research(body: ResearchBody, _guest: dict = Depends(maybe_guest)):
     return await do_research(body.topic.strip(), body.category)
 
 
 @api.post("/code")
-async def code(body: CodeBody):
+async def code(body: CodeBody, _guest: dict = Depends(maybe_guest)):
     system = (
         f"You generate clean, working {body.language} code. "
         "Reply with ONLY the code — no markdown fences, no prose explanations."
@@ -690,6 +749,133 @@ async def admin_set_direct_mode(body: DirectModeBody):
         upsert=True,
     )
     return {"enabled": bool(body.enabled)}
+
+
+# ── Access mode + invite codes ─────────────────────────────────────────
+@api.get("/access-mode")
+async def get_access_mode():
+    doc = await config.find_one({"_id": "access_mode"})
+    return {"require_guest_pass": bool(doc and doc.get("require_guest_pass"))}
+
+
+@api.post("/admin/access-mode", dependencies=[Depends(require_admin)])
+async def set_access_mode(body: AccessModeBody):
+    await config.update_one(
+        {"_id": "access_mode"},
+        {"$set": {"require_guest_pass": bool(body.enabled), "updated_at": _now()}},
+        upsert=True,
+    )
+    return {"require_guest_pass": bool(body.enabled)}
+
+
+@api.post("/admin/access-codes", dependencies=[Depends(require_admin)])
+async def create_access_code(body: CreateCodeBody):
+    code_str = _short_id(10)
+    for _ in range(3):
+        if not await access_codes.find_one({"code": code_str}):
+            break
+        code_str = _short_id(10)
+    expires_at = None
+    if body.expires_in_days and body.expires_in_days > 0:
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=int(body.expires_in_days))).isoformat()
+    doc = {
+        "code": code_str,
+        "label": (body.label or "")[:60],
+        "expires_at": expires_at,
+        "max_uses": int(body.max_uses) if body.max_uses else None,
+        "uses": 0,
+        "revoked": False,
+        "created_at": _now(),
+    }
+    await access_codes.insert_one(dict(doc))
+    return {k: v for k, v in doc.items() if k != "_id"}
+
+
+@api.get("/admin/access-codes", dependencies=[Depends(require_admin)])
+async def list_access_codes():
+    docs = await access_codes.find({}, {"_id": 0}).sort("created_at", -1).limit(200).to_list(200)
+    now = datetime.now(timezone.utc)
+    for d in docs:
+        exp = d.get("expires_at")
+        d["expired"] = bool(exp and datetime.fromisoformat(exp.replace("Z", "+00:00")) < now)
+        d["maxed"] = bool(d.get("max_uses") and d.get("uses", 0) >= d["max_uses"])
+        d["active"] = not (d["expired"] or d["maxed"] or d.get("revoked"))
+    return {"codes": docs, "count": len(docs)}
+
+
+@api.delete("/admin/access-codes/{code_str}", dependencies=[Depends(require_admin)])
+async def revoke_access_code(code_str: str):
+    r = await access_codes.update_one({"code": code_str}, {"$set": {"revoked": True, "revoked_at": _now()}})
+    if r.matched_count == 0:
+        raise HTTPException(404, "Code not found")
+    return {"revoked": code_str}
+
+
+@api.post("/guest-auth")
+async def guest_auth(body: GuestAuthBody):
+    code = (body.code or "").strip()
+    if not code:
+        raise HTTPException(400, "Code is required")
+    doc = await access_codes.find_one({"code": code})
+    if not doc:
+        raise HTTPException(401, "Invalid code")
+    if doc.get("revoked"):
+        raise HTTPException(401, "Code revoked")
+    if doc.get("max_uses") and doc.get("uses", 0) >= doc["max_uses"]:
+        raise HTTPException(401, "Code is used up")
+    exp = doc.get("expires_at")
+    if exp:
+        try:
+            exp_dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+            if exp_dt < datetime.now(timezone.utc):
+                raise HTTPException(401, "Code expired")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+    await access_codes.update_one({"code": code}, {"$inc": {"uses": 1}, "$set": {"last_used_at": _now()}})
+    token = make_guest_token(code, exp)
+    return {"token": token, "expires_at": exp, "label": doc.get("label", "")}
+
+
+# ── Bug reports ───────────────────────────────────────────────────────
+@api.post("/bug-reports")
+async def submit_bug_report(body: BugReportBody, _guest: dict = Depends(maybe_guest)):
+    description = (body.description or "").strip()
+    steps = (body.steps or "").strip()
+    if len(description) < 5:
+        raise HTTPException(400, "Tell me what went wrong (5+ characters)")
+    if len(steps) < 5:
+        raise HTTPException(400, "Tell me the steps to reach the bug (5+ characters)")
+    screenshot = body.screenshot or None
+    if screenshot and len(screenshot) > 700_000:    # ~512KB image + b64 overhead
+        raise HTTPException(413, "Screenshot too large (max ~500 KB)")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "description": description[:4000],
+        "steps": steps[:4000],
+        "screenshot": screenshot[:700_000] if screenshot else None,
+        "username": _clean_username(body.username),
+        "created_at": _now(),
+        "resolved": False,
+    }
+    await bug_reports.insert_one(dict(doc))
+    return {"id": doc["id"]}
+
+
+@api.get("/admin/bug-reports", dependencies=[Depends(require_admin)])
+async def list_bug_reports(limit: int = 100):
+    cursor = bug_reports.find({}, {"_id": 0}).sort("created_at", -1).limit(min(max(limit, 1), 500))
+    docs = await cursor.to_list(length=limit)
+    return {"reports": docs, "count": len(docs)}
+
+
+@api.delete("/admin/bug-reports/{report_id}", dependencies=[Depends(require_admin)])
+async def delete_bug_report(report_id: str):
+    r = await bug_reports.delete_one({"id": report_id})
+    if r.deleted_count == 0:
+        raise HTTPException(404, "Not found")
+    return {"deleted": report_id}
 
 
 # ── Admin oversight endpoints ───────────────────────────────────────────
@@ -806,6 +992,9 @@ async def on_startup():
     await chats.create_index("session_id")
     await chats.create_index("created_at")
     await qlog.create_index("count")
+    await access_codes.create_index("code", unique=True)
+    await bug_reports.create_index("id", unique=True)
+    await bug_reports.create_index("created_at")
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(process_queue, "interval", hours=6, id="auto_research",
                       next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2))

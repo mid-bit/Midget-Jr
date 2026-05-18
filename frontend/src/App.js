@@ -7,6 +7,7 @@ const HISTORY_KEY = "mj_chat_history";   // rolling short window for LLM context
 const ARCHIVE_KEY = "mj_chat_archive";   // local-device full archive
 const USERNAME_KEY = "mj_username";
 const SESSION_KEY = "mj_session_id";
+const GUEST_TOKEN_KEY = "mj_guest_token";
 const MAX_FILE_BYTES = 1024 * 1024;
 
 const EXT_MAP = {
@@ -55,6 +56,8 @@ const MODE_INTROS = {
   manage: "Browse, search, and delete the entries inside my brain. Each came from Research, Import, or auto-research. Removing one means I'll forget it.",
   queue: "Topics scheduled for me to research automatically every 6 hours. Auto-promoted entries (🤖) appear when 3+ visitors ask similar questions — I notice patterns and dig in on my own.",
   visitors: "See who's been chatting with me. Click any name to filter the question log. This is your audit trail of what visitors are asking.",
+  access: "Generate invite codes for friends, set expirations, and revoke access. Flip 'Private mode' on to require a code before anyone can chat.",
+  bugs: "Bug reports submitted by visitors via the 🐛 Bug button in the header. Includes screenshots if attached.",
 };
 
 const WELCOME_DISMISS_KEY = "mj_welcome_dismissed";
@@ -83,6 +86,12 @@ async function api(path, { method = "GET", body, auth = false } = {}) {
     const t = getToken();
     if (!t) throw new Error("Locked — unlock first");
     headers.Authorization = `Bearer ${t}`;
+  } else {
+    // Send guest token (or admin token if available) so private-mode endpoints work transparently
+    const gtok = localStorage.getItem(GUEST_TOKEN_KEY);
+    const admin = getToken();
+    if (admin) headers.Authorization = `Bearer ${admin}`;
+    else if (gtok) headers.Authorization = `Bearer ${gtok}`;
   }
   let res;
   try {
@@ -92,14 +101,15 @@ async function api(path, { method = "GET", body, auth = false } = {}) {
   } catch (netErr) {
     throw new Error("Network error — is the backend awake? (Render free tier sleeps after 15min; first request takes ~30s.)");
   }
-  // Read body exactly once, swallow errors so we never throw "body stream already read"
   let text = "";
   try { text = await res.text(); } catch { /* body unavailable */ }
   let data = null;
   if (text) { try { data = JSON.parse(text); } catch { /* not JSON */ } }
   if (!res.ok) {
     const msg = (data && (data.detail || data.error)) || `HTTP ${res.status}`;
-    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    const err = new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    err.status = res.status;
+    throw err;
   }
   return data || {};
 }
@@ -433,6 +443,141 @@ export default function App() {
   return <MainApp/>;
 }
 
+function GuestGate({ initialCode, onAuthed }) {
+  const [code, setCode] = useState(initialCode || "");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const submit = async () => {
+    setBusy(true); setErr("");
+    try {
+      const r = await api("/guest-auth", { method: "POST", body: { code: code.trim() } });
+      localStorage.setItem(GUEST_TOKEN_KEY, r.token);
+      onAuthed();
+    } catch (e) { setErr(e.message || "Invalid code"); }
+    setBusy(false);
+  };
+  useEffect(() => { if (initialCode) submit(); /* eslint-disable-next-line */ }, []);
+  return (
+    <div className="modal-bg">
+      <div className="modal" role="dialog">
+        <h2>🎟 Access required</h2>
+        <p>Midget jr. is in private mode. Enter your invite code to chat.</p>
+        <input value={code} onChange={(e)=>setCode(e.target.value)}
+          onKeyDown={(e)=>{ if(e.key==="Enter") submit(); }}
+          placeholder="Invite code" data-testid="guest-code-input" autoFocus/>
+        <div className="err">{err}</div>
+        <div className="actions">
+          <button className="qbtn" type="button" onClick={submit} disabled={busy} data-testid="guest-code-submit">
+            {busy ? "Checking…" : "Unlock"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function InviteDialog({ onClose }) {
+  const url = window.location.origin + window.location.pathname;
+  const [copied, setCopied] = useState(false);
+  const qrSrc = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&bgcolor=181825&color=cdd6f4&qzone=2&data=${encodeURIComponent(url)}`;
+  const onCopy = () => {
+    navigator.clipboard.writeText(url).catch(()=>{});
+    setCopied(true); setTimeout(()=>setCopied(false), 2000);
+  };
+  const onNative = async () => {
+    if (navigator.share) {
+      try { await navigator.share({ title: "Midget jr.", text: "Chat with my AI bot:", url }); } catch {}
+    } else { onCopy(); }
+  };
+  return (
+    <div className="modal-bg" onClick={(e)=>{ if(e.target.classList.contains("modal-bg")) onClose(); }}>
+      <div className="modal" role="dialog" style={{ width: "min(420px, 92vw)" }}>
+        <h2>🔗 Invite friends</h2>
+        <p>Anyone with this link can chat (and help me grow). If you're in private mode, hand out an invite code from the Access tab.</p>
+        <input readOnly value={url} onFocus={(e)=>e.target.select()} data-testid="invite-url"/>
+        <div style={{ textAlign: "center", margin: "14px 0" }}>
+          <img src={qrSrc} alt="QR code for invite link" width="180" height="180" style={{ borderRadius: 12 }}/>
+        </div>
+        <div className="actions">
+          <button className="btn-cancel" type="button" onClick={onClose}>Close</button>
+          <button className="btn-cancel" type="button" onClick={onNative}>Native share</button>
+          <button className="qbtn" type="button" onClick={onCopy} data-testid="invite-copy">{copied ? "✓ Copied" : "Copy link"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BugDialog({ onClose, username }) {
+  const [desc, setDesc] = useState("");
+  const [steps, setSteps] = useState("");
+  const [screenshot, setScreenshot] = useState(null);
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
+  const fileRef = useRef(null);
+  const onPick = (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    if (!/^image\//.test(f.type)) { setErr("Pick an image file"); return; }
+    if (f.size > 500_000) { setErr("Screenshot too big (max ~500 KB) — try a smaller one"); return; }
+    const fr = new FileReader();
+    fr.onload = () => setScreenshot(String(fr.result || ""));
+    fr.readAsDataURL(f);
+  };
+  const submit = async () => {
+    setErr(""); setBusy(true);
+    try {
+      if (desc.trim().length < 5) throw new Error("Tell me what went wrong (5+ chars).");
+      if (steps.trim().length < 5) throw new Error("Tell me the steps to reach it (5+ chars).");
+      await api("/bug-reports", { method: "POST", body: { description: desc, steps, screenshot, username } });
+      setDone(true);
+    } catch (e) { setErr(e.message || "Failed"); }
+    setBusy(false);
+  };
+  return (
+    <div className="modal-bg" onClick={(e)=>{ if(e.target.classList.contains("modal-bg") && !busy) onClose(); }}>
+      <div className="modal" role="dialog" style={{ width: "min(480px, 94vw)" }}>
+        {done ? (
+          <>
+            <h2>🐛 Thanks!</h2>
+            <p>Bug reported. The admin will see it in the 🐛 Bugs tab.</p>
+            <div className="actions"><button className="qbtn" onClick={onClose}>Close</button></div>
+          </>
+        ) : (
+          <>
+            <h2>🐛 Report a bug</h2>
+            <p>Tell me what broke and how to make it happen again.</p>
+            <textarea className="qinput" rows={3} placeholder="What went wrong?"
+              value={desc} onChange={(e)=>setDesc(e.target.value)}
+              style={{ width: "100%", marginBottom: 8, resize: "vertical", minHeight: 60 }}
+              data-testid="bug-desc"/>
+            <textarea className="qinput" rows={3} placeholder="Steps to reach the bug (1, 2, 3...)"
+              value={steps} onChange={(e)=>setSteps(e.target.value)}
+              style={{ width: "100%", marginBottom: 8, resize: "vertical", minHeight: 60 }}
+              data-testid="bug-steps"/>
+            <button type="button" className="btn-cancel" onClick={()=>fileRef.current?.click()}
+              style={{ width: "100%" }} data-testid="bug-screenshot-btn">
+              {screenshot ? "✓ Screenshot attached (click to replace)" : "📷 Attach screenshot (optional)"}
+            </button>
+            <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={onPick}/>
+            {screenshot && (
+              <img src={screenshot} alt="preview" style={{ width: "100%", marginTop: 8, borderRadius: 8, maxHeight: 180, objectFit: "contain", background: "#181825" }}/>
+            )}
+            <div className="err">{err}</div>
+            <div className="actions">
+              <button className="btn-cancel" type="button" onClick={onClose} disabled={busy}>Cancel</button>
+              <button className="qbtn" type="button" onClick={submit} disabled={busy} data-testid="bug-submit">
+                {busy ? "Sending…" : "Send report"}
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function MainApp() {
   const [mode, setMode] = useState("chat");
   const [lang, setLang] = useState("python");
@@ -480,6 +625,18 @@ function MainApp() {
   const [iBehavior, setIBehavior] = useState(false);
   const [iOwner, setIOwner] = useState("");
 
+  // Access / invite / bug-report state
+  const [accessMode, setAccessMode] = useState(null); // null until known; true=private
+  const [needsGate, setNeedsGate] = useState(false);
+  const [initialGateCode, setInitialGateCode] = useState(null);
+  const [showInvite, setShowInvite] = useState(false);
+  const [showBug, setShowBug] = useState(false);
+  const [codes, setCodes] = useState([]);
+  const [codeLabel, setCodeLabel] = useState("");
+  const [codeDays, setCodeDays] = useState(30);
+  const [codeMax, setCodeMax] = useState("");
+  const [bugList, setBugList] = useState([]);
+
   // Visitors
   const [visitors, setVisitors] = useState([]);
   const [chatLog, setChatLog] = useState([]);
@@ -498,6 +655,8 @@ function MainApp() {
     if (mode === "queue") loadQueue();
     if (mode === "manage" && unlocked) loadKB();
     if (mode === "visitors" && unlocked) loadVisitors();
+    if (mode === "access" && unlocked) loadAccess();
+    if (mode === "bugs" && unlocked) loadBugs();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, unlocked]);
 
@@ -512,6 +671,31 @@ function MainApp() {
   useEffect(() => {
     api("/direct-mode").then(r => setDirectMode(!!r.enabled)).catch(() => {});
   }, []);
+
+  // Check access mode + decide if guest gate is needed
+  useEffect(() => {
+    // Pre-fill from ?code= URL param so invite links auto-fill the gate
+    const u = new URL(window.location.href);
+    const codeParam = u.searchParams.get("code");
+    if (codeParam) setInitialGateCode(codeParam);
+
+    api("/access-mode").then(r => {
+      setAccessMode(!!r.require_guest_pass);
+      if (r.require_guest_pass && !localStorage.getItem(GUEST_TOKEN_KEY) && !getToken()) {
+        setNeedsGate(true);
+      }
+    }).catch(() => setAccessMode(false));
+  }, []);
+
+  const onGuestAuthed = () => {
+    setNeedsGate(false);
+    // Strip ?code= from URL after successful gate
+    const u = new URL(window.location.href);
+    if (u.searchParams.has("code")) {
+      u.searchParams.delete("code");
+      window.history.replaceState({}, "", u.toString());
+    }
+  };
 
   const toggleDirectMode = async () => {
     if (!(await requirePw("Direct Mode (drops disclaimers/refusals) requires the admin password."))) return;
@@ -670,6 +854,48 @@ function MainApp() {
     } catch (e) { alert("Failed: " + e.message); }
     setAdminLoading(false);
   }
+
+  async function loadAccess() {
+    try {
+      const r = await api("/admin/access-codes", { auth: true });
+      setCodes(r.codes || []);
+    } catch (e) { alert("Failed: " + e.message); }
+  }
+  const createCode = async () => {
+    try {
+      const body = { label: codeLabel.trim(), expires_in_days: Number(codeDays) || null, max_uses: codeMax ? Number(codeMax) : null };
+      await api("/admin/access-codes", { method: "POST", auth: true, body });
+      setCodeLabel(""); setCodeDays(30); setCodeMax("");
+      loadAccess();
+    } catch (e) { alert("Failed: " + e.message); }
+  };
+  const revokeCode = async (code) => {
+    if (!window.confirm(`Revoke code ${code}? Anyone using it will be locked out.`)) return;
+    try { await api(`/admin/access-codes/${code}`, { method: "DELETE", auth: true }); loadAccess(); }
+    catch (e) { alert("Failed: " + e.message); }
+  };
+  const togglePrivate = async () => {
+    try {
+      const r = await api("/admin/access-mode", { method: "POST", auth: true, body: { enabled: !accessMode } });
+      setAccessMode(!!r.require_guest_pass);
+    } catch (e) { alert("Failed: " + e.message); }
+  };
+  const copyCodeUrl = (code) => {
+    const url = `${window.location.origin}${window.location.pathname}?code=${code}`;
+    navigator.clipboard.writeText(url).catch(()=>{});
+  };
+
+  async function loadBugs() {
+    try {
+      const r = await api("/admin/bug-reports", { auth: true });
+      setBugList(r.reports || []);
+    } catch (e) { alert("Failed: " + e.message); }
+  }
+  const deleteBug = async (id) => {
+    if (!window.confirm("Delete this bug report?")) return;
+    try { await api(`/admin/bug-reports/${id}`, { method: "DELETE", auth: true }); loadBugs(); }
+    catch (e) { alert("Failed: " + e.message); }
+  };
   useEffect(() => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     if (mode === "visitors" && unlocked) loadVisitors();
@@ -744,7 +970,7 @@ function MainApp() {
   };
 
   const inputBarVisible = ["chat","query","research","code"].includes(mode);
-  const adminTabs = ["import", "manage", "queue", "visitors"];
+  const adminTabs = ["import", "manage", "queue", "visitors", "access", "bugs"];
   const visibleAdmin = unlocked ? adminTabs : [];
 
   return (
@@ -755,6 +981,12 @@ function MainApp() {
           <h1>Midget jr.</h1>
           <p>Self-growing · Research · Chat · Code</p>
         </div>
+        <button id="install-btn" onClick={()=>setShowInvite(true)} title="Invite friends with a link / QR code" data-testid="invite-btn">
+          <span>🔗</span><span>Invite</span>
+        </button>
+        <button id="bug-btn" onClick={()=>setShowBug(true)} title="Report a bug" data-testid="bug-btn">
+          <span>🐛</span><span>Bug</span>
+        </button>
         {installEvt && (
           <button id="install-btn" onClick={installApp} title="Install as app" data-testid="install-btn">
             <span>📲</span><span>Install</span>
@@ -802,7 +1034,7 @@ function MainApp() {
         ))}
         {visibleAdmin.map(m => (
           <button key={m} className={"tab admin-tab" + (mode === m ? ` active-${m}` : "")} onClick={()=>setMode(m)} data-testid={`tab-${m}`}>
-            {{import:"📂 Import",manage:"🗂 Manage",queue:"📋 Queue",visitors:"👥 Visitors"}[m]}
+            {{import:"📂 Import",manage:"🗂 Manage",queue:"📋 Queue",visitors:"👥 Visitors",access:"🎟 Access",bugs:"🐛 Bugs"}[m]}
           </button>
         ))}
         {mode === "code" && (
@@ -814,7 +1046,7 @@ function MainApp() {
 
       <div id="mode-label">{MODE_LABELS[mode]}</div>
 
-      {!["queue","import","manage","visitors"].includes(mode) && (
+      {!["queue","import","manage","visitors","access","bugs"].includes(mode) && (
         <div id="messages" data-testid="messages">
           <div className="tab-intro" data-testid={`intro-${mode}`}>
             <span className="tab-intro-pill">{ {chat:"💬",query:"🔍",research:"🌐",code:"💻"}[mode] }</span>
@@ -999,6 +1231,89 @@ function MainApp() {
                     </div>
                   ))}
             </div>
+          </div>
+        </div>
+      )}
+
+      {mode === "access" && (
+        <div className="side-panel">
+          <div className="tab-intro" data-testid="intro-access">
+            <span className="tab-intro-pill">🎟</span>
+            <span>{MODE_INTROS.access}</span>
+          </div>
+          <div className="panel-card">
+            <h3>🔐 Private mode {accessMode ? "ON" : "OFF"}</h3>
+            <p className="hint" style={{ marginTop: 0 }}>When ON, everyone (except admins) needs an invite code to chat.</p>
+            <button className={"qbtn" + (accessMode ? "" : "")}
+              onClick={togglePrivate}
+              style={{ background: accessMode ? "var(--pink)" : "linear-gradient(135deg, var(--blue), var(--purple))" }}
+              data-testid="toggle-private">
+              {accessMode ? "Turn OFF private mode" : "Turn ON private mode"}
+            </button>
+          </div>
+          <div className="panel-card">
+            <h3>➕ Generate invite code</h3>
+            <div className="row-flex">
+              <input className="qinput" placeholder="Label (e.g. 'Alex')" value={codeLabel} onChange={(e)=>setCodeLabel(e.target.value)}/>
+              <input className="qinput" type="number" placeholder="Expires in days" value={codeDays} onChange={(e)=>setCodeDays(e.target.value)} style={{ maxWidth: 140 }}/>
+              <input className="qinput" type="number" placeholder="Max uses (blank = ∞)" value={codeMax} onChange={(e)=>setCodeMax(e.target.value)} style={{ maxWidth: 160 }}/>
+              <button className="qbtn" onClick={createCode} data-testid="create-code-btn">Create</button>
+            </div>
+          </div>
+          <div>
+            {codes.length === 0 ? <div className="empty-state">No codes yet. Create one above 👆</div>
+              : codes.map(c => (
+                <div key={c.code} className={"code-row" + (c.active ? "" : " inactive")}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div className="code-line">
+                      <span className="code-text">{c.code}</span>
+                      {c.label && <span className="code-label">{c.label}</span>}
+                      <span className={"code-status " + (c.active ? "ok" : "off")}>{c.active ? "active" : (c.revoked ? "revoked" : c.expired ? "expired" : c.maxed ? "used up" : "off")}</span>
+                    </div>
+                    <div className="qi-meta">
+                      <span className="qi-tag" style={{ color: "#a6adc8" }}>uses: {c.uses}{c.max_uses ? "/"+c.max_uses : ""}</span>
+                      {c.expires_at && <span className="qi-tag" style={{ color: "#a6e3a1" }}>expires {new Date(c.expires_at).toLocaleDateString()}</span>}
+                      <span className="qi-tag" style={{ color: "#6c7086" }}>made {new Date(c.created_at).toLocaleDateString()}</span>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <button className="copy-btn" onClick={()=>copyCodeUrl(c.code)} title="Copy invite URL">🔗 Link</button>
+                    {!c.revoked && c.active && (
+                      <button className="qi-del" onClick={()=>revokeCode(c.code)} title="Revoke">✕</button>
+                    )}
+                  </div>
+                </div>
+              ))}
+          </div>
+        </div>
+      )}
+
+      {mode === "bugs" && (
+        <div className="side-panel">
+          <div className="tab-intro" data-testid="intro-bugs">
+            <span className="tab-intro-pill">🐛</span>
+            <span>{MODE_INTROS.bugs}</span>
+          </div>
+          <div className="panel-card">
+            <h3>🐛 Bug reports ({bugList.length})</h3>
+            <div className="hint" style={{ marginTop: 0 }}>Newest first. Click delete to clear once handled.</div>
+          </div>
+          <div>
+            {bugList.length === 0 ? <div className="empty-state">No bugs reported yet 🎉</div>
+              : bugList.map(b => (
+                <div key={b.id} className="bug-item">
+                  <div className="bug-head">
+                    <span className="bug-user">👤 {b.username || "guest"}</span>
+                    <span className="bug-time">{new Date(b.created_at).toLocaleString()}</span>
+                    <button className="qi-del" onClick={()=>deleteBug(b.id)} title="Delete">✕</button>
+                  </div>
+                  <div className="bug-section"><span className="bug-label">What broke:</span> {b.description}</div>
+                  <div className="bug-section"><span className="bug-label">Steps:</span> {b.steps}</div>
+                  {b.screenshot && (
+                    <img src={b.screenshot} alt="screenshot" style={{ marginTop: 10, maxWidth: "100%", borderRadius: 8, background: "#181825", display: "block" }}/>
+                  )}
+                </div>
+              ))}
           </div>
         </div>
       )}
