@@ -20,11 +20,16 @@ import jwt
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from motor.motor_asyncio import AsyncIOMotorClient
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError
 from pydantic import BaseModel, Field
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
 from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import JSONResponse
 
 # ── Setup ────────────────────────────────────────────────────────────────
 ROOT_DIR = Path(__file__).parent
@@ -64,6 +69,21 @@ log = logging.getLogger("midgetjr")
 app = FastAPI(title="Midget jr.")
 api = APIRouter(prefix="/api")
 
+# Rate limiting — single global cap protects free-tier LLM keys from abuse.
+# 60/min/IP is generous for humans and stops most bots/scripts cold.
+limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"],
+                  headers_enabled=True)
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
+
+
+@app.exception_handler(RateLimitExceeded)
+async def _ratelimit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Slow down — too many requests in a row. Try again in a moment."},
+    )
+
 # ── Models ───────────────────────────────────────────────────────────────
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -78,6 +98,7 @@ class ChatBody(BaseModel):
     history: List[dict] = Field(default_factory=list)
     session_id: Optional[str] = None
     username: Optional[str] = None
+    citation_style: Optional[str] = "none"   # none | mla | apa | chicago | ieee | numbered
 
 
 class ShareBody(BaseModel):
@@ -153,6 +174,17 @@ class LearningUnlockBody(BaseModel):
 class LearningRunBody(BaseModel):
     limit: int = 20
     min_score: int = 7
+
+
+class TeachBody(BaseModel):
+    """A user-flagged exchange ("👍 Teach Midget"). We re-judge it and (if good)
+    save it as a high-priority exemplar."""
+    question: str
+    answer: str
+    username: Optional[str] = None
+    session_id: Optional[str] = None
+    chat_id: Optional[str] = None
+    citation_style: Optional[str] = "none"
 
 
 class KnowledgeEntry(BaseModel):
@@ -312,9 +344,23 @@ def llm_client(provider: Optional[str] = None) -> tuple[AsyncOpenAI, str]:
 async def llm_chat(messages: List[dict], temperature: float = 0.7,
                    provider: Optional[str] = None) -> str:
     cli, model = llm_client(provider)
-    r = await cli.chat.completions.create(
-        model=model, messages=messages, temperature=temperature
-    )
+    try:
+        r = await cli.chat.completions.create(
+            model=model, messages=messages, temperature=temperature
+        )
+    except RateLimitError as e:
+        # Surface a friendly message instead of a generic stack trace
+        used_provider = (provider or LLM_PROVIDER).lower()
+        alt = "groq" if used_provider == "gemini" else "gemini"
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"⏳ {used_provider.title()} daily quota reached. "
+                f"Paste a {alt.title()} key into backend/.env "
+                f"({'GROQ_API_KEY' if alt=='groq' else 'GEMINI_API_KEY'}) "
+                "or wait for the daily reset."
+            ),
+        ) from e
     return (r.choices[0].message.content or "").strip()
 
 
@@ -323,6 +369,60 @@ async def llm_oneshot(system: str, prompt: str, provider: Optional[str] = None) 
         {"role": "system", "content": system},
         {"role": "user", "content": prompt},
     ], provider=provider)
+
+
+# ── Citation contract ───────────────────────────────────────────────────
+CITATION_STYLES = {
+    "none": "",
+    "numbered": (
+        "CITATION FORMAT — numbered. Use bracketed numbers like [1], [2] inline. "
+        "End with a '## Sources' section listing each number with its full URL/title."
+    ),
+    "mla": (
+        "CITATION FORMAT — MLA 9th. After any borrowed claim, use a parenthetical author-page "
+        "or shortened-title where author is unknown. Example: (Smith 42) or (\"Title\" 12). "
+        "End with a '## Works Cited' list using MLA format: "
+        "Author Last, First. \"Title.\" Site Name, Day Month Year, URL."
+    ),
+    "apa": (
+        "CITATION FORMAT — APA 7th. Inline author-date parentheticals like (Smith, 2024) or "
+        "(Title of Page, 2024). End with a '## References' list using APA format: "
+        "Author, A. (Year). Title. Site Name. URL"
+    ),
+    "chicago": (
+        "CITATION FORMAT — Chicago author-date. Inline (Smith 2024, 42). "
+        "End with a '## References' section in Chicago format: "
+        "Author Last, First. Year. \"Title.\" Site Name. URL."
+    ),
+    "ieee": (
+        "CITATION FORMAT — IEEE. Use bracketed numbers [1], [2] inline. "
+        "End with a '## References' list numbered: "
+        "[1] A. Author, \"Title,\" Site Name, Year. [Online]. Available: URL"
+    ),
+}
+
+
+def _citation_contract(style: Optional[str]) -> str:
+    """Return a system-prompt block instructing the model to be truthful and cite
+    in the requested style. Always-on truthfulness clause is included."""
+    style = (style or "none").lower()
+    truth = (
+        "TRUTHFULNESS CONTRACT: Only assert things that are actually supported by the "
+        "knowledge base context, your training, or are common consensus knowledge. "
+        "If a claim isn't supported, prefix it with 'I'm not sure but' or say 'I don't know'. "
+        "Never fabricate sources, URLs, authors, dates, page numbers, or quotes. "
+        "When you do quote a source, use double quotes verbatim from the KB context."
+    )
+    rule = CITATION_STYLES.get(style, "")
+    if not rule:
+        return truth
+    return (
+        f"{truth}\n\n{rule}\n"
+        "When KB context is provided below, prefer quoting it directly (a sentence or two "
+        "in quotation marks) over paraphrasing. Cite every quoted or borrowed claim. "
+        "If no KB context is available, say so plainly and rely on general knowledge "
+        "without inventing citations."
+    )
 
 
 # ── Knowledge search ─────────────────────────────────────────────────────
@@ -558,6 +658,9 @@ async def chat(body: ChatBody, _guest: dict = Depends(maybe_guest)):
         )
 
     parts = [base_persona]
+    cite_block = _citation_contract(body.citation_style)
+    if cite_block:
+        parts.append(cite_block)
     if behavior_block:
         parts.append(behavior_block)
     if style_block:
@@ -578,14 +681,17 @@ async def chat(body: ChatBody, _guest: dict = Depends(maybe_guest)):
 
     try:
         reply = await llm_chat(messages)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(502, f"LLM error: {e}")
+        raise HTTPException(502, f"LLM error: {e}") from e
 
     asyncio.create_task(_log_exchange(body.session_id, body.username, body.message, reply, len(ctx_docs)))
     asyncio.create_task(_maybe_auto_promote(body.message))
 
     return {"reply": reply, "context_used": len(ctx_docs), "direct_mode": direct,
-            "exemplars_used": len(exemplar_docs)}
+            "exemplars_used": len(exemplar_docs),
+            "citation_style": (body.citation_style or "none").lower()}
 
 
 async def _get_direct_mode() -> bool:
@@ -752,8 +858,10 @@ async def code(body: CodeBody, _guest: dict = Depends(maybe_guest)):
     )
     try:
         out = await llm_oneshot(system, body.prompt)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(502, f"LLM error: {e}")
+        raise HTTPException(502, f"LLM error: {e}") from e
     # Strip accidental triple-fence wrappers
     out = re.sub(r"^```[a-zA-Z0-9]*\n", "", out.strip())
     out = re.sub(r"\n```$", "", out)
@@ -1059,12 +1167,20 @@ def _parse_judge_json(raw: str) -> dict:
 
 
 JUDGE_SYSTEM = (
-    "You are a strict but fair evaluator. You read a chatbot's reply to a user's question "
-    "and rate it on whether it (a) actually helps a human, (b) is honest and accurate, "
-    "(c) carries no health, safety, or wellbeing risk, and (d) is well-written and direct. "
+    "You are a strict but fair evaluator of chatbot answers. Read the user's question "
+    "and the bot's answer, then score the answer 0-10 across all of these dimensions "
+    "combined: "
+    "(a) actually helps the human, "
+    "(b) factually accurate / truthful — no fabricated facts, "
+    "(c) cites real sources where claims need backing (any inline marker like [1], "
+    "(Author Year), or a 'Sources/References' section counts; full made-up citations "
+    "should be punished hard), "
+    "(d) carries no health, safety, or wellbeing risk, "
+    "(e) is direct and well-written. "
     "Reply ONLY with a JSON object like "
-    '{"score": 0-10, "reason": "one short sentence", "approved": true/false}. '
-    "approved=true means score >= 7 AND no harm. No prose outside JSON."
+    '{"score": 0-10, "reason": "one short sentence on truth + citations + helpfulness", '
+    '"approved": true/false}. '
+    "approved=true means score >= 7 AND no fabrication AND no harm. No prose outside JSON."
 )
 
 
@@ -1157,6 +1273,62 @@ async def toggle_exemplar(ex_id: str):
     new_val = not bool(doc.get("approved"))
     await exemplars.update_one({"id": ex_id}, {"$set": {"approved": new_val}})
     return {"id": ex_id, "approved": new_val}
+
+
+@api.post("/learning/teach")
+async def learning_teach(body: TeachBody, _guest: dict = Depends(maybe_guest)):
+    """Public endpoint: a user clicked '👍 Teach Midget' on a reply.
+    We immediately run the LLM-judge on just this exchange. Approved (score >= 7,
+    truthful, no harm) answers become high-priority exemplars right away.
+    Lower-scoring picks are still saved but marked pending so an admin can review."""
+    q = (body.question or "").strip()
+    a = (body.answer or "").strip()
+    if len(q) < 3 or len(a) < 3:
+        raise HTTPException(400, "Need a question and an answer to teach.")
+    # Dedupe: if this exact pair already exists, just bump priority
+    existing = await exemplars.find_one(
+        {"question": q[:2000], "answer": a[:4000]},
+        {"_id": 0, "id": 1, "approved": 1, "score": 1},
+    )
+    if existing:
+        await exemplars.update_one(
+            {"id": existing["id"]},
+            {"$inc": {"teach_votes": 1}, "$set": {"last_teach_at": _now()}},
+        )
+        return {
+            "id": existing["id"],
+            "score": existing.get("score", 0),
+            "approved": bool(existing.get("approved")),
+            "reason": "already saved — bumped vote count",
+            "cached": True,
+        }
+    prompt = f"USER QUESTION:\n{q[:1500]}\n\nBOT ANSWER:\n{a[:3000]}"
+    try:
+        raw = await llm_oneshot(JUDGE_SYSTEM, prompt, provider=RESEARCH_LLM_PROVIDER)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Judge error: {e}") from e
+    verdict = _parse_judge_json(raw)
+    approved = verdict["approved"] and verdict["score"] >= 7
+    ex_doc = {
+        "id": str(uuid.uuid4()),
+        "chat_id": body.chat_id,
+        "question": q[:2000],
+        "answer": a[:4000],
+        "score": verdict["score"],
+        "reason": verdict["reason"],
+        "approved": approved,
+        "username": _clean_username(body.username),
+        "session_id": body.session_id,
+        "citation_style": (body.citation_style or "none").lower(),
+        "teach_votes": 1,
+        "via": "teach_button",
+        "created_at": _now(),
+    }
+    await exemplars.insert_one(dict(ex_doc))
+    return {"id": ex_doc["id"], "score": verdict["score"],
+            "approved": approved, "reason": verdict["reason"]}
 
 
 # ── Auto-research scheduler ──────────────────────────────────────────────

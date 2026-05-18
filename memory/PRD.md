@@ -46,7 +46,12 @@ User uploaded a single-file HTML app **Midget jr.** (Chat / Query / Research / C
 - ✅ Behavior files (admin), per-user style mimicry (from owner-tagged uploads)
 - ✅ Guest invite codes with expiry + max uses, Private mode toggle, Share+QR modal, Bug reports + screenshots
 - ✅ PWA install button
-- ✅ **Learning Mode (NEW 2026-02-18)** — password gate `AI-0verlord`, LLM-as-judge endpoint reads recent chats, scores each Q+A 0–10 on "helps humanity + no health risk", saves approved ones to `exemplars` collection. Top 4 approved exemplars are injected as few-shot examples into every chat's system prompt. Admin can manually approve/reject/delete from the Learning tab.
+- ✅ **Learning Mode (2026-02-18)** — password gate `AI-0verlord`, LLM-as-judge endpoint reads recent chats, scores each Q+A 0–10 on "helps humanity + truth + cites real sources + no health risk", saves approved ones to `exemplars` collection. Top 4 approved exemplars are injected as few-shot examples into every chat's system prompt. Admin can manually approve/reject/delete from the Learning tab.
+- ✅ **Citation styles (2026-02-19)** — chat-tab dropdown: None / Numbered [1] / MLA / APA / Chicago / IEEE. Selected style is sent to `/api/chat`, which injects a truthfulness-contract + citation-format instruction into the system prompt. Bot is instructed to quote sources verbatim where possible, never fabricate citations.
+- ✅ **👍 Teach Midget button (2026-02-19)** — every bot reply now has a "👍 Teach" button. One click runs the LLM judge on just that one Q+A pair, shows the verdict inline, and saves it as a high-priority exemplar (auto-approved if score ≥ 7, else pending admin review).
+- ✅ **Friendlier LLM-quota errors (2026-02-19)** — when Gemini/Groq returns 429, the user sees "⏳ Gemini daily quota reached. Paste a Groq key into backend/.env (GROQ_API_KEY) or wait for the daily reset." instead of "HTTP 502".
+- ✅ **Rate limiting (2026-02-19)** — slowapi middleware caps every IP at 60 requests/minute globally; emits `X-RateLimit-*` headers and a friendly 429 message.
+- ✅ **Frontend `api()` helper switched from fetch → XHR (2026-02-19)** — the dev preview environment installs a global `fetch` interceptor that drains the response body before app code can read it; XHR isn't intercepted the same way, so error bodies now reach the UI.
 - ✅ **Bug-fix (2026-02-18)** — GuestGate, InviteDialog, BugDialog modals are now actually mounted (previously defined but never rendered in JSX).
 
 ## What's Waiting On the User
@@ -61,9 +66,9 @@ User uploaded a single-file HTML app **Midget jr.** (Chat / Query / Research / C
 
 ## Next Action Items
 1. **(blocking)** User pastes Groq API key → Research + Learning judge stop hitting Gemini quota.
-2. **(P1)** Rate-limit public endpoints before any wide deploy.
-3. **(P2)** Component split for App.js (`components/AdminTabs.js`, `components/Modals.js`).
-4. **(P2)** Server-side chat history viewer in admin (already in DB).
+2. **(P2)** Component split for App.js (~1700 lines now) into `components/AdminTabs.js`, `components/Modals.js`.
+3. **(P2)** Real-time learning feedback — auto-run the judge in the background after every N chat exchanges.
+4. **(P3)** Embeddings-based KB search instead of regex.
 
 ## Test Credentials
 - Admin password: `MidgetsRcool` (POST `/api/unlock`)

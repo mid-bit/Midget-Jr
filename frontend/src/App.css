@@ -285,14 +285,21 @@ pre.code-block {
 }
 
 /* ── Share button on bot bubbles ───────────────────────────────────── */
+.bubble-actions {
+  display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  margin-top: 8px;
+}
 .share-link-btn {
-  display: inline-block; margin-top: 8px; margin-right: 6px;
+  display: inline-block;
   background: transparent; color: var(--teal);
   border: 1px solid #74c7ec55; border-radius: 14px;
   padding: 3px 10px; font-size: 11px; font-family: inherit;
   cursor: pointer; transition: all .2s;
 }
 .share-link-btn:hover { background: #74c7ec22; border-color: var(--teal); }
+.share-link-btn.teach { color: #94e2d5; border-color: #94e2d555; }
+.share-link-btn.teach:hover { background: #94e2d522; border-color: #94e2d5; }
+.teach-status { font-size: 11px; margin-left: 4px; }
 
 /* ── History modal: source tabs ────────────────────────────────────── */
 .history-tabs { display: flex; gap: 6px; margin-bottom: 10px; }

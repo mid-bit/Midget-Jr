@@ -67,6 +67,15 @@ const WELCOME_DISMISS_KEY = "mj_welcome_dismissed";
 
 const LANGS = ["python","javascript","typescript","java","c++","go","rust","sql","bash","html","css","json","markdown"];
 const CATEGORIES = ["General","Science","Technology","History","Math","Health","Philosophy","Art"];
+const CITATION_STYLES = [
+  { id: "none",     label: "No citations" },
+  { id: "numbered", label: "Numbered [1]" },
+  { id: "mla",      label: "MLA (parenthetical + Works Cited)" },
+  { id: "apa",      label: "APA (author-date + References)" },
+  { id: "chicago",  label: "Chicago (author-date)" },
+  { id: "ieee",     label: "IEEE [1] (numbered references)" },
+];
+const CITATION_KEY = "mj_citation_style";
 const ACCEPT = ".txt,.md,.markdown,.json,.csv,.log,.yaml,.yml,.xml,.html,.htm,.css,.js,.mjs,.ts,.tsx,.jsx,.py,.go,.rs,.java,.cpp,.cc,.c,.h,.hpp,.sh,.bash,.sql,.toml,.ini,.conf,.rb,.php,.swift,.kt";
 
 const uuid = () => "s" + Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -96,28 +105,34 @@ async function api(path, { method = "GET", body, auth = false, learn = false } =
     if (!t) throw new Error("Locked — unlock first");
     headers.Authorization = `Bearer ${t}`;
   } else {
-    // Send guest token (or admin token if available) so private-mode endpoints work transparently
     const gtok = localStorage.getItem(GUEST_TOKEN_KEY);
     const admin = getToken();
     if (admin) headers.Authorization = `Bearer ${admin}`;
     else if (gtok) headers.Authorization = `Bearer ${gtok}`;
   }
-  let res;
-  try {
-    res = await fetch(`${API}${path}`, {
-      method, headers, body: body ? JSON.stringify(body) : undefined,
-    });
-  } catch (netErr) {
+  // We use XMLHttpRequest instead of fetch because the dev preview environment
+  // installs a global fetch interceptor that consumes the body stream before
+  // our code gets a chance to read it. XHR isn't intercepted the same way.
+  const { status, ok, text } = await new Promise((resolve) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(method, `${API}${path}`, true);
+    Object.entries(headers).forEach(([k, v]) => xhr.setRequestHeader(k, v));
+    xhr.onload = () => resolve({ status: xhr.status, ok: xhr.status >= 200 && xhr.status < 300, text: xhr.responseText || "" });
+    xhr.onerror = () => resolve({ status: 0, ok: false, text: "", networkError: true });
+    xhr.send(body ? JSON.stringify(body) : null);
+  });
+  if (status === 0) {
     throw new Error("Network error — is the backend awake? (Render free tier sleeps after 15min; first request takes ~30s.)");
   }
-  let text = "";
-  try { text = await res.text(); } catch { /* body unavailable */ }
   let data = null;
   if (text) { try { data = JSON.parse(text); } catch { /* not JSON */ } }
-  if (!res.ok) {
-    const msg = (data && (data.detail || data.error)) || `HTTP ${res.status}`;
+  if (!ok) {
+    let msg = "";
+    if (data) msg = data.detail || data.error || data.message || "";
+    if (!msg && text && text.length < 500) msg = text;
+    if (!msg) msg = `HTTP ${status}`;
     const err = new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
-    err.status = res.status;
+    err.status = status;
     throw err;
   }
   return data || {};
@@ -293,7 +308,7 @@ function CodeBlock({ code, lang }) {
   );
 }
 
-function Bubble({ msg, onShare }) {
+function Bubble({ msg, onShare, onTeach }) {
   if (msg.role === "user") {
     return (
       <div className="msg-row user">
@@ -303,6 +318,7 @@ function Bubble({ msg, onShare }) {
     );
   }
   const shareable = !!msg.lastUserQuestion && (msg.content || msg.code);
+  const teachable = shareable && !msg.teachStatus;
   return (
     <div className="msg-row bot">
       <div className="bubble-avatar bot">🧠</div>
@@ -316,12 +332,37 @@ function Bubble({ msg, onShare }) {
             <span className="ctx-badge">📚 Used {msg.ctx} knowledge entr{msg.ctx>1?"ies":"y"}</span>
           </>
         )}
-        {shareable && (
-          <button className="share-link-btn" type="button"
-            onClick={()=>onShare(msg)} data-testid="bubble-share-btn">
-            🔗 Share
-          </button>
+        {msg.exemplarsUsed > 0 && (
+          <>
+            {" "}
+            <span className="ctx-badge" style={{ background: "#94e2d522", color: "#94e2d5", borderColor: "#94e2d544" }}>
+              🧪 Imitating {msg.exemplarsUsed} exemplar{msg.exemplarsUsed>1?"s":""}
+            </span>
+          </>
         )}
+        <div className="bubble-actions">
+          {shareable && (
+            <button className="share-link-btn" type="button"
+              onClick={()=>onShare(msg)} data-testid="bubble-share-btn">
+              🔗 Share
+            </button>
+          )}
+          {teachable && (
+            <button className="share-link-btn teach" type="button"
+              onClick={()=>onTeach(msg)} data-testid="bubble-teach-btn"
+              title="Tell Midget this was a good answer. An LLM judge will verify truth + citations + safety, then save it as a learning exemplar.">
+              👍 Teach
+            </button>
+          )}
+          {msg.teachStatus && (
+            <span className="teach-status" data-testid="bubble-teach-status"
+              style={{ color: msg.teachStatus.approved ? "#a6e3a1" : "#f9e2af" }}>
+              {msg.teachStatus.approved
+                ? `✅ Saved as exemplar (score ${msg.teachStatus.score}/10)`
+                : `📝 Saved pending review (score ${msg.teachStatus.score}/10) — ${msg.teachStatus.reason || ""}`}
+            </span>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -690,6 +731,12 @@ function MainApp() {
   const [learnLimit, setLearnLimit] = useState(20);
   const [learnMinScore, setLearnMinScore] = useState(7);
 
+  // Citation style — persisted across sessions
+  const [citationStyle, setCitationStyle] = useState(
+    () => localStorage.getItem(CITATION_KEY) || "none"
+  );
+  useEffect(() => { localStorage.setItem(CITATION_KEY, citationStyle); }, [citationStyle]);
+
   // Visitors
   const [visitors, setVisitors] = useState([]);
   const [chatLog, setChatLog] = useState([]);
@@ -793,8 +840,9 @@ function MainApp() {
     const archiveBuf = [{ role: "user", content: t, mode, username, at: now }];
     try {
       if (mode === "chat") {
-        const r = await api("/chat", { method: "POST", body: { message: t, history, session_id: sessionId, username } });
-        pushBotIn("chat", { content: r.reply, ctx: r.context_used, lastUserQuestion: t, mode: "chat" });
+        const r = await api("/chat", { method: "POST", body: { message: t, history, session_id: sessionId, username, citation_style: citationStyle } });
+        pushBotIn("chat", { content: r.reply, ctx: r.context_used, exemplarsUsed: r.exemplars_used || 0,
+          lastUserQuestion: t, mode: "chat", citationStyle: r.citation_style });
         archiveBuf.push({ role: "bot", content: r.reply, mode, at: new Date().toISOString() });
         const h2 = [...history, { role: "user", content: t }, { role: "assistant", content: r.reply }];
         while (h2.length > 12) h2.splice(0, 2);
@@ -840,6 +888,38 @@ function MainApp() {
       }});
       setShareDlgId(r.id);
     } catch (e) { alert("Share failed: " + e.message); }
+  };
+
+  const onTeachBubble = async (msg) => {
+    // Optimistically mark the bubble as "judging…"
+    setMessagesByMode(s => {
+      const arr = (s[mode] || []).map(m => m === msg
+        ? { ...m, teachStatus: { pending: true, score: 0, approved: false, reason: "Judging…" } }
+        : m);
+      return { ...s, [mode]: arr };
+    });
+    try {
+      const answer = msg.code ? `Here's your ${msg.lang} code:\n\n${msg.code}` : (msg.content || "");
+      const r = await api("/learning/teach", { method: "POST", body: {
+        question: msg.lastUserQuestion || "",
+        answer,
+        username, session_id: sessionId,
+        citation_style: msg.citationStyle || citationStyle,
+      }});
+      setMessagesByMode(s => {
+        const arr = (s[mode] || []).map(m => m === msg
+          ? { ...m, teachStatus: { score: r.score, approved: r.approved, reason: r.reason } }
+          : m);
+        return { ...s, [mode]: arr };
+      });
+    } catch (e) {
+      setMessagesByMode(s => {
+        const arr = (s[mode] || []).map(m => m === msg
+          ? { ...m, teachStatus: { score: 0, approved: false, reason: e.message || "Failed" } }
+          : m);
+        return { ...s, [mode]: arr };
+      });
+    }
   };
 
   const refreshQueue = () => loadQueue();
@@ -1155,6 +1235,13 @@ function MainApp() {
             {LANGS.map(l => <option key={l} value={l}>{l}</option>)}
           </select>
         )}
+        {mode === "chat" && (
+          <select id="lang-select" value={citationStyle}
+            onChange={(e)=>setCitationStyle(e.target.value)} data-testid="citation-select"
+            title="Pick a citation style. Midget will quote sources and cite in this format.">
+            {CITATION_STYLES.map(c => <option key={c.id} value={c.id}>📑 {c.label}</option>)}
+          </select>
+        )}
       </div>
 
       <div id="mode-label">{MODE_LABELS[mode]}</div>
@@ -1168,7 +1255,7 @@ function MainApp() {
           {messages.length === 0 && (
             <div className="empty-conversation">No {mode} messages yet — go ahead and try one 👇</div>
           )}
-          {messages.map((m, i) => <Bubble key={i} msg={m} onShare={onShareBubble}/>)}
+          {messages.map((m, i) => <Bubble key={i} msg={m} onShare={onShareBubble} onTeach={onTeachBubble}/>)}
           {typing && <Typing/>}
           <div ref={messagesEnd}/>
         </div>
