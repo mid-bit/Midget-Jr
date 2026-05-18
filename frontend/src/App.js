@@ -473,6 +473,13 @@ function MainApp() {
   const [kbLoading, setKbLoading] = useState(false);
   const [kbSearch, setKbSearch] = useState("");
 
+  // Direct mode state (admin)
+  const [directMode, setDirectMode] = useState(false);
+
+  // Behavior + owner toggles inside Import tab
+  const [iBehavior, setIBehavior] = useState(false);
+  const [iOwner, setIOwner] = useState("");
+
   // Visitors
   const [visitors, setVisitors] = useState([]);
   const [chatLog, setChatLog] = useState([]);
@@ -500,6 +507,19 @@ function MainApp() {
     window.addEventListener("beforeinstallprompt", h);
     return () => window.removeEventListener("beforeinstallprompt", h);
   }, []);
+
+  // Sync direct mode state on load + after unlock changes
+  useEffect(() => {
+    api("/direct-mode").then(r => setDirectMode(!!r.enabled)).catch(() => {});
+  }, []);
+
+  const toggleDirectMode = async () => {
+    if (!(await requirePw("Direct Mode (drops disclaimers/refusals) requires the admin password."))) return;
+    try {
+      const r = await api("/admin/direct-mode", { method: "POST", auth: true, body: { enabled: !directMode } });
+      setDirectMode(!!r.enabled);
+    } catch (e) { alert("Failed: " + e.message); }
+  };
 
   const requirePw = useCallback((label) => new Promise((resolve) => {
     if (getToken()) return resolve(true);
@@ -675,7 +695,14 @@ function MainApp() {
         if (f.size > MAX_FILE_BYTES) throw new Error(`too big (${(f.size/1024).toFixed(0)}KB > 1024KB)`);
         const content = await readFileText(f);
         if (!content.trim()) throw new Error("file is empty");
-        items.push({ name: f.name, content, category: iCategory || "Imported", tags: userTags });
+        items.push({
+          name: f.name,
+          content,
+          category: iBehavior ? "Behavior" : (iCategory || "Imported"),
+          tags: userTags,
+          behavior: iBehavior,
+          owner: (iOwner || "").trim() || null,
+        });
         setImportRows(prev => {
           const copy = [...prev]; const idx = copy.findIndex(x => x.name === f.name && x.status === "queued…");
           if (idx >= 0) copy[idx] = { ...copy[idx], status: "reading…" };
@@ -743,6 +770,12 @@ function MainApp() {
           <span>{unlocked ? "🔓" : "🔒"}</span>
           <span>{unlocked ? "Unlocked" : "Locked"}</span>
         </button>
+        {unlocked && (
+          <button id="direct-toggle" className={directMode ? "on" : ""} onClick={toggleDirectMode} data-testid="direct-toggle" title="Direct Mode: drops disclaimers and refusals on edgy-but-legitimate topics">
+            <span>{directMode ? "⚡" : "🛡"}</span>
+            <span>{directMode ? "Direct ON" : "Direct OFF"}</span>
+          </button>
+        )}
       </div>
 
       {!welcomeDismissed && (
@@ -864,10 +897,20 @@ function MainApp() {
                 data-testid="file-input"/>
             </label>
             <div className="row-flex" style={{ marginTop: 12 }}>
-              <input className="qinput" placeholder="Category (optional)" value={iCategory} onChange={(e)=>setICategory(e.target.value)}/>
+              <input className="qinput" placeholder="Category (optional)" value={iCategory} onChange={(e)=>setICategory(e.target.value)} disabled={iBehavior}/>
               <input className="qinput" placeholder="Tags, comma-separated (optional)" value={iTags} onChange={(e)=>setITags(e.target.value)}/>
             </div>
-            <div className="hint">🔒 Importing requires the admin password. Files are read in-browser and saved as knowledge entries (text only, max 1&nbsp;MB each).</div>
+            <div className="row-flex" style={{ marginTop: 10 }}>
+              <label className="check-row" style={{ flex: 1 }}>
+                <input type="checkbox" checked={iBehavior} onChange={(e)=>setIBehavior(e.target.checked)} data-testid="behavior-toggle"/>
+                <span>🎨 <b>Behavior file</b> — change how Midget acts (prepended to every chat's system prompt)</span>
+              </label>
+            </div>
+            <div className="row-flex" style={{ marginTop: 8 }}>
+              <input className="qinput" placeholder="Owner username (for style-mimicry, leave blank for shared)" value={iOwner} onChange={(e)=>setIOwner(e.target.value)} data-testid="owner-input"/>
+            </div>
+            <div className="hint">🔒 Importing requires the admin password. Files are read in-browser and saved as knowledge entries (text only, max 1&nbsp;MB each).{" "}
+              <strong>Behavior</strong> files alter the bot's voice for everyone. Files with an <strong>Owner</strong> get used as writing-style samples when that user chats.</div>
           </div>
           <div id="import-list">
             {importRows.map((row, i) => (

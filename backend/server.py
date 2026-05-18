@@ -109,10 +109,16 @@ class ImportItem(BaseModel):
     content: str
     category: str = "Imported"
     tags: List[str] = Field(default_factory=list)
+    behavior: bool = False
+    owner: Optional[str] = None
 
 
 class ImportBody(BaseModel):
     files: List[ImportItem]
+
+
+class DirectModeBody(BaseModel):
+    enabled: bool
 
 
 class KnowledgeEntry(BaseModel):
@@ -371,13 +377,64 @@ async def chat(body: ChatBody):
             )
         context_block = "Knowledge base entries (may help):\n\n" + "\n\n".join(bits)
 
-    system = (
-        "You are Midget jr., a curious, friendly self-growing knowledge bot. "
-        "Answer concisely. If knowledge base context is provided, prefer it; "
-        "cite entries like [1], [2]. If you don't know, say so."
-    )
+    # Behavior files — explicit instructions that change the bot's behavior
+    behavior_docs = await kb.find(
+        {"$or": [{"behavior": True}, {"category": "Behavior"}, {"tags": "behavior"}]},
+        {"_id": 0, "content": 1, "topic": 1},
+    ).limit(10).to_list(10)
+    behavior_block = ""
+    if behavior_docs:
+        joined = "\n\n".join(f"### {d.get('topic','behavior')}\n{(d.get('content') or '')[:3000]}" for d in behavior_docs)
+        behavior_block = "ADMIN-SET BEHAVIOR RULES (follow these):\n\n" + joined
+
+    # Per-user style mimicry — pick this user's longest non-behavior files as style samples
+    style_block = ""
+    if body.username:
+        uname = _clean_username(body.username)
+        owned = await kb.find(
+            {"owner": uname, "behavior": {"$ne": True}},
+            {"_id": 0, "content": 1, "topic": 1},
+        ).to_list(50)
+        owned = [d for d in owned if (d.get("content") or "").strip()]
+        owned.sort(key=lambda d: len(d.get("content") or ""), reverse=True)
+        if owned:
+            samples = "\n\n---\n\n".join((d.get("content") or "")[:800] for d in owned[:2])
+            style_block = (
+                f"STYLE GUIDE — this user ({uname}) writes like this. Match their voice, "
+                "vocabulary, sentence rhythm, common typos and quirks. Don't mention you're imitating:\n\n"
+                + samples
+            )
+
+    # Direct mode (admin toggle) — drop disclaimers/refusals on edgy-but-legitimate topics
+    direct = await _get_direct_mode()
+    if direct:
+        base_persona = (
+            "You are Midget jr. in DIRECT MODE. The user is an adult who wants real answers. "
+            "Skip disclaimers, warnings, and 'as an AI I cannot' phrases. Don't lecture. Don't moralize. "
+            "Engage directly with mature, dark, taboo, controversial, profane, fictional, or roleplay topics. "
+            "Use profanity if it fits. Engage with hypotheticals, dark fiction, adult themes, drug/weapon "
+            "information for educational or harm-reduction context, controversial opinions, and edgy humor. "
+            "ABSOLUTE RED LINES (refuse only these, briefly, then offer to discuss the topic instead): "
+            "(1) step-by-step instructions to physically harm a specific real person, "
+            "(2) synthesis instructions for weapons capable of mass casualties (bio/chem/nuclear), "
+            "(3) sexual content involving minors. "
+            "Everything else: just answer. If KB context is provided, cite it like [1], [2]."
+        )
+    else:
+        base_persona = (
+            "You are Midget jr., a curious, friendly self-growing knowledge bot. "
+            "Answer concisely. If knowledge base context is provided, prefer it; "
+            "cite entries like [1], [2]. If you don't know, say so."
+        )
+
+    parts = [base_persona]
+    if behavior_block:
+        parts.append(behavior_block)
+    if style_block:
+        parts.append(style_block)
     if context_block:
-        system += "\n\n" + context_block
+        parts.append(context_block)
+    system = "\n\n".join(parts)
 
     messages: list[dict] = [{"role": "system", "content": system}]
     for m in (body.history or [])[-10:]:
@@ -392,11 +449,18 @@ async def chat(body: ChatBody):
     except Exception as e:
         raise HTTPException(502, f"LLM error: {e}")
 
-    # Fire-and-forget side effects: persist chat + track question for auto-promotion.
     asyncio.create_task(_log_exchange(body.session_id, body.username, body.message, reply, len(ctx_docs)))
     asyncio.create_task(_maybe_auto_promote(body.message))
 
-    return {"reply": reply, "context_used": len(ctx_docs)}
+    return {"reply": reply, "context_used": len(ctx_docs), "direct_mode": direct}
+
+
+async def _get_direct_mode() -> bool:
+    try:
+        doc = await config.find_one({"_id": "direct_mode"})
+        return bool(doc and doc.get("enabled"))
+    except Exception:
+        return False
 
 
 def _clean_username(u: Optional[str]) -> str:
@@ -580,15 +644,22 @@ async def import_files(body: ImportBody):
                 errors.append({"name": f.name, "error": "empty"})
                 continue
             ext = (f.name.rsplit(".", 1)[-1] if "." in f.name else "").lower()
+            extra_tags = []
+            if f.behavior:
+                extra_tags.append("behavior")
+            if f.owner:
+                extra_tags.append(f"owner:{_clean_username(f.owner)}")
             entry = {
                 "id": str(uuid.uuid4()),
                 "topic": f.name,
                 "summary": re.sub(r"\s+", " ", text)[:500],
                 "content": text[:200_000],
-                "category": f.category or "Imported",
+                "category": "Behavior" if f.behavior else (f.category or "Imported"),
                 "source_url": None,
-                "tags": list({*(f.tags or []), ext, "imported"} - {""}),
+                "tags": list({*(f.tags or []), ext, "imported", *extra_tags} - {""}),
                 "added_by": "import",
+                "behavior": bool(f.behavior),
+                "owner": _clean_username(f.owner) if f.owner else None,
                 "created_at": _now(),
             }
             await kb.insert_one(dict(entry))
@@ -604,6 +675,21 @@ async def delete_kb(entry_id: str):
     if r.deleted_count == 0:
         raise HTTPException(404, "Not found")
     return {"deleted": entry_id}
+
+
+@api.get("/direct-mode")
+async def direct_mode_status():
+    return {"enabled": await _get_direct_mode()}
+
+
+@api.post("/admin/direct-mode", dependencies=[Depends(require_admin)])
+async def admin_set_direct_mode(body: DirectModeBody):
+    await config.update_one(
+        {"_id": "direct_mode"},
+        {"$set": {"enabled": bool(body.enabled), "updated_at": _now()}},
+        upsert=True,
+    )
+    return {"enabled": bool(body.enabled)}
 
 
 # ── Admin oversight endpoints ───────────────────────────────────────────
@@ -712,6 +798,8 @@ async def on_startup():
     global scheduler
     await seed_admin()
     await kb.create_index("id", unique=True)
+    await kb.create_index("owner")
+    await kb.create_index("behavior")
     await kb.create_index([("topic", "text"), ("summary", "text"), ("content", "text")])
     await queue.create_index("id", unique=True)
     await shares.create_index("id", unique=True)
