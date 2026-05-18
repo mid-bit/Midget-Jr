@@ -84,13 +84,23 @@ async function api(path, { method = "GET", body, auth = false } = {}) {
     if (!t) throw new Error("Locked — unlock first");
     headers.Authorization = `Bearer ${t}`;
   }
-  const res = await fetch(`${API}${path}`, {
-    method, headers, body: body ? JSON.stringify(body) : undefined,
-  });
-  const text = await res.text();
+  let res;
+  try {
+    res = await fetch(`${API}${path}`, {
+      method, headers, body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (netErr) {
+    throw new Error("Network error — is the backend awake? (Render free tier sleeps after 15min; first request takes ~30s.)");
+  }
+  // Read body exactly once, swallow errors so we never throw "body stream already read"
+  let text = "";
+  try { text = await res.text(); } catch { /* body unavailable */ }
   let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch {}
-  if (!res.ok) throw new Error((data && data.detail) || `HTTP ${res.status}`);
+  if (text) { try { data = JSON.parse(text); } catch { /* not JSON */ } }
+  if (!res.ok) {
+    const msg = (data && (data.detail || data.error)) || `HTTP ${res.status}`;
+    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+  }
   return data || {};
 }
 

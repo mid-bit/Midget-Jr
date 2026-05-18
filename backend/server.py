@@ -34,6 +34,7 @@ MONGO_URL = os.environ["MONGO_URL"]
 DB_NAME = os.environ["DB_NAME"]
 JWT_SECRET = os.environ["JWT_SECRET"]
 ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
+LEARNING_PASSWORD = os.environ.get("LEARNING_PASSWORD", "AI-0verlord")
 
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "gemini").lower()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
