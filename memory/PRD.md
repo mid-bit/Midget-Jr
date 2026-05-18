@@ -1,80 +1,70 @@
 # Midget jr. — Product Requirements (PRD)
 
 ## Original Problem Statement
-User uploaded a single-file HTML app called **Midget jr.** — a self-growing knowledge bot with Chat, Query, Research, Code, and Queue modes — running on **base44** as backend. After a code review, the user asked to (a) fix flagged issues, (b) add file-import to grow the bot's knowledge, and (c) password-protect admin actions with `MidgetsRcool`. Then they asked to move off base44 to a real owned backend, and finally to make it **zero-cost forever** with **no strings attached**, deployable to **the cloud**.
+User uploaded a single-file HTML app **Midget jr.** (Chat / Query / Research / Code / Queue) running on the `base44` proprietary backend. They asked, in order, to: (1) fix flagged bugs, (2) add file-import to grow the bot's knowledge, (3) password-protect admin with `MidgetsRcool`, (4) move off base44 to an owned backend, (5) make it **zero-cost forever, no strings**, (6) add PWA, chat history, per-tab isolation, Direct Mode, user-style mimicry, guest invite codes, bug reporting, share links + QR, (7) add a **Learning Mode** (LLM-as-judge reinforcement) gated by `AI-0verlord`, and (8) route **Research** through Groq while keeping **Chat/Query** on Gemini.
 
-## User Choices (final)
-- **LLM:** Configurable via `LLM_PROVIDER` env. Supports **Google Gemini** (free tier, 1,500 req/day) **and Groq** (free tier, llama-3.1-8b-instant). User toggles by env var.
-- **LLM access:** Uses each provider's **OpenAI-compatible endpoint** via the `openai` Python client → one code path for both.
-- **NO Emergent dependency** — `emergentintegrations` removed from requirements; user owns every credential.
-- **Web research:** Google primary (via googlesearch-python) + DuckDuckGo fallback (DDGS — works from datacenter IPs).
-- **Admin password:** `MidgetsRcool`, bcrypt-hashed in MongoDB.
-- **Deploy target:** Koyeb (backend) + MongoDB Atlas (db) + Vercel (frontend) + Gemini/Groq (LLM) — **all free, no credit cards anywhere**.
-- **Auto-research scheduler:** Kept, runs every 6 hours, only fires when pending queue items exist.
-
-## Architecture
+## Architecture (current)
 | Layer | Tech | Free home |
 |---|---|---|
-| Frontend | React 19 (CRA), Catppuccin theme, Geist font, single `App.js` | **Vercel** free |
-| Backend | FastAPI + Motor (async MongoDB) | **Koyeb** free (always-on web service) |
-| LLM | `openai.AsyncOpenAI` → Gemini *or* Groq via OpenAI-compatible base URLs | **Gemini AI Studio** or **Groq Cloud** free tier |
-| Web search | `googlesearch-python` → `ddgs` fallback | Free, no key |
-| Web scrape | `httpx` + `BeautifulSoup4` | — |
-| Auth | bcrypt + 7-day JWT | — |
-| Scheduler | `APScheduler` (in-process, every 6h) | — |
-| Persistence | MongoDB: `knowledge_entries`, `research_queue`, `app_config` | **MongoDB Atlas** M0 free (512 MB forever) |
+| Frontend | React 19 (stripped CRA), Catppuccin theme, single `App.js` | Vercel |
+| Backend | FastAPI + Motor (async MongoDB) | Render / Koyeb |
+| LLM | `openai.AsyncOpenAI` → Gemini *or* Groq via OpenAI-compatible base URLs | Gemini AI Studio + Groq Cloud |
+| Web search | googlesearch-python → ddgs fallback | free, no key |
+| Web scrape | httpx + BeautifulSoup4 | — |
+| Auth | bcrypt + JWT (admin 7d, guest mirrors code expiry, learning 30d) | — |
+| Scheduler | APScheduler in-process, every 6h | — |
+| DB | MongoDB collections: `knowledge_entries`, `research_queue`, `app_config`, `shares`, `chat_messages`, `question_log`, `access_codes`, `bug_reports`, `exemplars` | MongoDB Atlas M0 |
 
-## Environment Variables (all configurable)
+## Environment Variables
 | Var | Purpose |
 |---|---|
-| `MONGO_URL` | MongoDB connection (Atlas SRV string in prod) |
-| `DB_NAME` | Database name (default `midgetjr_db`) |
-| `JWT_SECRET` | JWT signing secret |
-| `ADMIN_PASSWORD` | Admin password (seeded into bcrypt hash on startup) |
-| `LLM_PROVIDER` | `gemini` (default) or `groq` — toggle without code changes |
-| `GEMINI_API_KEY` | Free key from aistudio.google.com/apikey |
-| `GEMINI_MODEL` | Default `gemini-2.0-flash` (most generous free quota) |
-| `GROQ_API_KEY` | Free key from console.groq.com/keys |
-| `GROQ_MODEL` | Default `llama-3.1-8b-instant` |
-| `CORS_ORIGINS` | Comma-separated allowed origins |
+| `MONGO_URL` / `DB_NAME` | MongoDB |
+| `JWT_SECRET` | JWT signing |
+| `ADMIN_PASSWORD` | Admin (`MidgetsRcool`), bcrypt-seeded |
+| `LEARNING_PASSWORD` | Learning Mode gate (`AI-0verlord`) |
+| `LLM_PROVIDER` | Default provider: `gemini` or `groq` (chat/query/code) |
+| `RESEARCH_LLM_PROVIDER` | Optional override for Research mode (set `groq` to save Gemini quota) |
+| `GEMINI_API_KEY` / `GEMINI_MODEL` | Gemini config (default `gemini-2.0-flash`, currently `gemini-2.5-flash`) |
+| `GROQ_API_KEY` / `GROQ_MODEL` | Groq config (default `llama-3.1-8b-instant`) |
+| `CORS_ORIGINS` | comma-separated allow list |
 
 ## Endpoints (all under `/api`)
-**Public:** `GET /`, `POST /unlock`, `POST /chat`, `POST /query`, `POST /research`, `POST /code`, `GET /knowledge`, `GET /queue`
-**Admin (Bearer JWT):** `POST /knowledge/import`, `DELETE /knowledge/{id}`, `POST /queue`, `DELETE /queue/{id}`, `POST /queue/run`
+**Public:** `/`, `/unlock`, `/chat`, `/query`, `/research`, `/code`, `/knowledge`, `/queue`, `/share`, `/share/{id}`, `/access-mode`, `/guest-auth`, `/bug-reports`, `/direct-mode`, `/chat/history/{session}`
+**Admin (Bearer JWT):** `/knowledge/import`, `/knowledge/{id}` DELETE, `/queue` POST, `/queue/{id}` DELETE, `/queue/run`, `/admin/direct-mode`, `/admin/access-mode`, `/admin/access-codes` GET/POST, `/admin/access-codes/{code}` DELETE, `/admin/bug-reports` GET, `/admin/bug-reports/{id}` DELETE, `/admin/visitors`, `/admin/chat-log`
+**Learning (Bearer JWT):** `/learning-unlock`, `/learning/run`, `/admin/exemplars` GET, `/admin/exemplars/{id}` DELETE, `/admin/exemplars/{id}/toggle`
 
-## What's Implemented (2026-01-16)
-- ✅ Full migration off base44 → owned FastAPI/MongoDB backend
-- ✅ Pluggable free LLM (Gemini default, Groq alternative) via OpenAI-compatible endpoints
-- ✅ Zero Emergent dependency — `emergentintegrations` uninstalled
-- ✅ All 6 frontend tabs: Chat, Query, Research, Code, Import, Queue
-- ✅ Lock toggle, password modal, sessionStorage JWT
-- ✅ Chat persists in localStorage, replays last 6 turns
-- ✅ File import (drag-drop + click), 25+ text formats, 1MB cap
-- ✅ Auto-research scheduler (6h, only on pending items)
-- ✅ Catppuccin theme + Geist font
-- ✅ XSS-safe DOM rendering
-- ✅ bcrypt password seed re-runs if ADMIN_PASSWORD env changes
-- ✅ Helpful error messages when API key is missing (points user to free signup URL)
-- ✅ Testing subagent verified: 11/11 backend tests pass, all critical frontend flows pass
-- ✅ **Deploy artifacts written:** `backend/Dockerfile`, `render.yaml`, `frontend/vercel.json`, `DEPLOY.md` (step-by-step click-by-click guide)
-- ✅ **Live on Gemini 2.5 Flash** (free tier — gemini-2.0-flash was demoted by Google so we use 2.5)
-- ✅ **`.env` and `backend/.env` added to .gitignore** + `.env.example` committed (prevents API key leak when pushing)
-- ✅ **Public-share-friendly:** welcome message now explains visitors can chat/query/research, only admin can import/manage queue
-- ✅ **Downloadable code:** every Code-tab output has a ⬇ Download button (correct extension + MIME per language: html, css, js, py, json, md, etc.)
-- ✅ **Persistent chat archive:** every exchange (user + bot) silently saved to localStorage (`mj_chat_archive`, cap 5000). Reload shows clean welcome (no replay). Header 📜 History button opens a date-grouped, searchable modal with Export-JSON and Clear-history actions.
+## What's Implemented
+- ✅ Full migration off base44 → owned FastAPI/MongoDB
+- ✅ Pluggable free LLM (Gemini default, Groq alt) via OpenAI-compatible endpoints
+- ✅ **Per-mode LLM routing**: `RESEARCH_LLM_PROVIDER=groq` keeps Research on Groq while Chat/Query/Code stay on Gemini. Falls back gracefully if the override key is missing.
+- ✅ 6 frontend tabs (Chat, Query, Research, Code, Import, Queue) + 4 admin tabs (Manage, Visitors, Access, Bugs) + Learning tab
+- ✅ Catppuccin theme, per-tab message isolation, tab intros, welcome banner
+- ✅ Persistent chat archive (5000 cap, localStorage), date-grouped history modal, export-JSON
+- ✅ XSS-safe DOM rendering, bcrypt admin seed, helpful missing-key errors
+- ✅ Auto-research scheduler (6h, only when pending) + auto-promote popular questions
+- ✅ Direct Mode toggle (admin) — drops disclaimers on edgy-but-legit topics; absolute red lines kept
+- ✅ Behavior files (admin), per-user style mimicry (from owner-tagged uploads)
+- ✅ Guest invite codes with expiry + max uses, Private mode toggle, Share+QR modal, Bug reports + screenshots
+- ✅ PWA install button
+- ✅ **Learning Mode (NEW 2026-02-18)** — password gate `AI-0verlord`, LLM-as-judge endpoint reads recent chats, scores each Q+A 0–10 on "helps humanity + no health risk", saves approved ones to `exemplars` collection. Top 4 approved exemplars are injected as few-shot examples into every chat's system prompt. Admin can manually approve/reject/delete from the Learning tab.
+- ✅ **Bug-fix (2026-02-18)** — GuestGate, InviteDialog, BugDialog modals are now actually mounted (previously defined but never rendered in JSX).
 
 ## What's Waiting On the User
-- 🟡 **Gemini API key** — user said they'd grab one at aistudio.google.com/apikey and paste it. Once pasted into `GEMINI_API_KEY` env, all LLM features come alive. Backend returns a friendly error pointing at the signup URL until then.
+- 🟡 **Groq API key** — `RESEARCH_LLM_PROVIDER=groq` is set in `.env`; user needs to paste a Groq key at https://console.groq.com/keys to free Gemini quota for chat/query/code only.
 
 ## Known Limitations / Backlog
-- KB search is regex-based (no embeddings) — fine for hundreds of docs (P1).
-- No KB management UI — can import/delete via API only (P1).
-- APScheduler is in-process; durable cron needs Redis-backed queue (P2).
+- KB search is regex-based (no embeddings) — fine for hundreds of docs (P2).
+- APScheduler is in-process; durable cron needs Redis (P2).
 - No rate limiting on public endpoints — add before any public deployment (P1).
-- Ollama (truly local zero-cloud) not wired in yet but documented in DEPLOY.md (P2).
+- `frontend/src/App.js` is ~1500 lines — extracting modals/tabs into components would help (P2).
+- Learning judge uses `RESEARCH_LLM_PROVIDER` to save default-tier quota; consider exposing a dedicated `LEARNING_LLM_PROVIDER` env if needed (P3).
 
-## Next Action Items (priority)
-1. **(blocking)** User pastes Gemini API key → re-test chat/research/code end-to-end.
-2. **(P1)** KB management panel in UI.
-3. **(P1)** Rate limiting before public deploy.
-4. **(P2)** Ollama as a third provider option.
+## Next Action Items
+1. **(blocking)** User pastes Groq API key → Research + Learning judge stop hitting Gemini quota.
+2. **(P1)** Rate-limit public endpoints before any wide deploy.
+3. **(P2)** Component split for App.js (`components/AdminTabs.js`, `components/Modals.js`).
+4. **(P2)** Server-side chat history viewer in admin (already in DB).
+
+## Test Credentials
+- Admin password: `MidgetsRcool` (POST `/api/unlock`)
+- Learning password: `AI-0verlord` (POST `/api/learning-unlock`)

@@ -3,6 +3,7 @@ import "./App.css";
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 const UNLOCK_KEY = "mj_token";
+const LEARN_KEY = "mj_learning_token";
 const HISTORY_KEY = "mj_chat_history";   // rolling short window for LLM context
 const ARCHIVE_KEY = "mj_chat_archive";   // local-device full archive
 const USERNAME_KEY = "mj_username";
@@ -28,7 +29,7 @@ const downloadText = (filename, text, mime = "text/plain") => {
 const MODE_COLORS = {
   chat: "#f38ba8", query: "#89b4fa", research: "#a6e3a1",
   code: "#cba6f7", import: "#fab387", queue: "#f9e2af",
-  visitors: "#74c7ec", manage: "#f5c2e7",
+  visitors: "#74c7ec", manage: "#f5c2e7", learning: "#94e2d5",
 };
 const MODE_LABELS = {
   chat: "💬 Chat — ask me anything, I'll use my knowledge base + AI",
@@ -39,6 +40,7 @@ const MODE_LABELS = {
   manage: "🗂 Manage — list, search, delete knowledge entries (admin)",
   queue: "📋 Queue — topics scheduled for auto-research every 6 hours",
   visitors: "👥 Visitors — see who's been asking what (admin)",
+  learning: "🧪 Learning — judge past answers and save the good ones as exemplars",
 };
 const MODE_PLACEHOLDERS = {
   chat: "Ask me anything...",
@@ -58,6 +60,7 @@ const MODE_INTROS = {
   visitors: "See who's been chatting with me. Click any name to filter the question log. This is your audit trail of what visitors are asking.",
   access: "Generate invite codes for friends, set expirations, and revoke access. Flip 'Private mode' on to require a code before anyone can chat.",
   bugs: "Bug reports submitted by visitors via the 🐛 Bug button in the header. Includes screenshots if attached.",
+  learning: "Reinforcement-by-judging. Run a pass and an LLM judge rates each past answer on whether it helps humanity and carries no health risk. Approved Q+A pairs become in-context exemplars that future replies imitate.",
 };
 
 const WELCOME_DISMISS_KEY = "mj_welcome_dismissed";
@@ -74,15 +77,21 @@ const loadJSON = (k, fallback) => {
 const saveJSON = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 const getToken = () => sessionStorage.getItem(UNLOCK_KEY) || "";
 const setToken = (t) => t ? sessionStorage.setItem(UNLOCK_KEY, t) : sessionStorage.removeItem(UNLOCK_KEY);
+const getLearnToken = () => localStorage.getItem(LEARN_KEY) || "";
+const setLearnToken = (t) => t ? localStorage.setItem(LEARN_KEY, t) : localStorage.removeItem(LEARN_KEY);
 const getOrCreateSessionId = () => {
   let s = localStorage.getItem(SESSION_KEY);
   if (!s) { s = uuid(); localStorage.setItem(SESSION_KEY, s); }
   return s;
 };
 
-async function api(path, { method = "GET", body, auth = false } = {}) {
+async function api(path, { method = "GET", body, auth = false, learn = false } = {}) {
   const headers = { "Content-Type": "application/json" };
-  if (auth) {
+  if (learn) {
+    const t = getLearnToken() || getToken();   // admin token also works for Learning endpoints
+    if (!t) throw new Error("Learning mode locked — unlock first");
+    headers.Authorization = `Bearer ${t}`;
+  } else if (auth) {
     const t = getToken();
     if (!t) throw new Error("Locked — unlock first");
     headers.Authorization = `Bearer ${t}`;
@@ -147,6 +156,40 @@ function PasswordModal({ label, onClose, onUnlock }) {
         <div className="actions">
           <button className="btn-cancel" type="button" onClick={onClose}>Cancel</button>
           <button className="qbtn" type="button" onClick={submit} data-testid="password-submit">Unlock</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LearningModal({ onClose, onUnlock }) {
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState("");
+  const inputRef = useRef(null);
+  useEffect(() => { inputRef.current?.focus(); }, []);
+  const submit = async () => {
+    try {
+      const r = await api("/learning-unlock", { method: "POST", body: { password: pw } });
+      setLearnToken(r.token);
+      onUnlock();
+    } catch (e) {
+      setErr(e.message || "Wrong password");
+      inputRef.current?.select();
+    }
+  };
+  return (
+    <div className="modal-bg" onClick={(e)=>{ if(e.target.classList.contains("modal-bg")) onClose(); }}>
+      <div className="modal" role="dialog">
+        <h2>🧪 Learning mode</h2>
+        <p>Type the learning password to open the Learning tab. Behind it, an LLM judge will read past answers and save the helpful ones as exemplars that future replies imitate.</p>
+        <input ref={inputRef} type="password" value={pw}
+          onChange={(e)=>setPw(e.target.value)}
+          onKeyDown={(e)=>{ if(e.key==="Enter") submit(); if(e.key==="Escape") onClose(); }}
+          placeholder="Learning password" autoComplete="off" data-testid="learning-password-input"/>
+        <div className="err">{err}</div>
+        <div className="actions">
+          <button className="btn-cancel" type="button" onClick={onClose}>Cancel</button>
+          <button className="qbtn" type="button" onClick={submit} data-testid="learning-password-submit">Unlock</button>
         </div>
       </div>
     </div>
@@ -637,6 +680,16 @@ function MainApp() {
   const [codeMax, setCodeMax] = useState("");
   const [bugList, setBugList] = useState([]);
 
+  // Learning mode (LLM-as-judge → exemplars)
+  const [learnUnlocked, setLearnUnlocked] = useState(!!getLearnToken());
+  const [showLearnGate, setShowLearnGate] = useState(false);
+  const [exemplarsList, setExemplarsList] = useState([]);
+  const [learnApprovedOnly, setLearnApprovedOnly] = useState(false);
+  const [learnRunning, setLearnRunning] = useState(false);
+  const [learnLastRun, setLearnLastRun] = useState(null);
+  const [learnLimit, setLearnLimit] = useState(20);
+  const [learnMinScore, setLearnMinScore] = useState(7);
+
   // Visitors
   const [visitors, setVisitors] = useState([]);
   const [chatLog, setChatLog] = useState([]);
@@ -657,8 +710,9 @@ function MainApp() {
     if (mode === "visitors" && unlocked) loadVisitors();
     if (mode === "access" && unlocked) loadAccess();
     if (mode === "bugs" && unlocked) loadBugs();
+    if (mode === "learning" && (learnUnlocked || unlocked)) loadExemplars();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, unlocked]);
+  }, [mode, unlocked, learnUnlocked]);
 
   // PWA install prompt capture
   useEffect(() => {
@@ -896,6 +950,46 @@ function MainApp() {
     try { await api(`/admin/bug-reports/${id}`, { method: "DELETE", auth: true }); loadBugs(); }
     catch (e) { alert("Failed: " + e.message); }
   };
+
+  async function loadExemplars(approvedOnly = learnApprovedOnly) {
+    try {
+      const r = await api(`/admin/exemplars?approved_only=${approvedOnly ? "true" : "false"}&limit=200`, { learn: true });
+      setExemplarsList(r.exemplars || []);
+    } catch (e) {
+      if (/Learning mode locked/i.test(e.message)) { setLearnUnlocked(false); setShowLearnGate(true); }
+      else alert("Failed: " + e.message);
+    }
+  }
+  const runLearningPass = async () => {
+    setLearnRunning(true);
+    try {
+      const r = await api("/learning/run", { method: "POST", learn: true,
+        body: { limit: Number(learnLimit) || 20, min_score: Number(learnMinScore) || 7 } });
+      setLearnLastRun(r);
+      await loadExemplars();
+    } catch (e) {
+      if (/Learning mode locked/i.test(e.message)) { setLearnUnlocked(false); setShowLearnGate(true); }
+      else alert("Learning pass failed: " + e.message);
+    }
+    setLearnRunning(false);
+  };
+  const deleteExemplar = async (id) => {
+    if (!window.confirm("Delete this exemplar? It won't be injected into future replies.")) return;
+    try { await api(`/admin/exemplars/${id}`, { method: "DELETE", learn: true }); loadExemplars(); }
+    catch (e) { alert("Failed: " + e.message); }
+  };
+  const toggleExemplar = async (id) => {
+    try { await api(`/admin/exemplars/${id}/toggle`, { method: "POST", learn: true }); loadExemplars(); }
+    catch (e) { alert("Failed: " + e.message); }
+  };
+  const openLearningTab = () => {
+    if (!getLearnToken() && !getToken()) { setShowLearnGate(true); return; }
+    setLearnUnlocked(true); setMode("learning");
+  };
+  const lockLearning = () => {
+    setLearnToken(""); setLearnUnlocked(false);
+    if (mode === "learning") setMode("chat");
+  };
   useEffect(() => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     if (mode === "visitors" && unlocked) loadVisitors();
@@ -972,6 +1066,7 @@ function MainApp() {
   const inputBarVisible = ["chat","query","research","code"].includes(mode);
   const adminTabs = ["import", "manage", "queue", "visitors", "access", "bugs"];
   const visibleAdmin = unlocked ? adminTabs : [];
+  const showLearningTab = learnUnlocked || unlocked;
 
   return (
     <div id="app">
@@ -1008,6 +1103,18 @@ function MainApp() {
             <span>{directMode ? "Direct ON" : "Direct OFF"}</span>
           </button>
         )}
+        <button id="learn-btn"
+          className={learnUnlocked ? "on" : ""}
+          onClick={learnUnlocked ? openLearningTab : ()=>setShowLearnGate(true)}
+          title="Learning mode — judge past answers, save the good ones as exemplars"
+          data-testid="learning-btn">
+          <span>🧪</span><span>{learnUnlocked ? "Learning" : "Learn"}</span>
+        </button>
+        {learnUnlocked && (
+          <button id="learn-lock-btn" className="btn-cancel" onClick={lockLearning} title="Lock learning mode" data-testid="learning-lock-btn">
+            <span>🔒</span>
+          </button>
+        )}
       </div>
 
       {!welcomeDismissed && (
@@ -1037,6 +1144,12 @@ function MainApp() {
             {{import:"📂 Import",manage:"🗂 Manage",queue:"📋 Queue",visitors:"👥 Visitors",access:"🎟 Access",bugs:"🐛 Bugs"}[m]}
           </button>
         ))}
+        {showLearningTab && (
+          <button className={"tab admin-tab" + (mode === "learning" ? " active-learning" : "")}
+            onClick={()=>setMode("learning")} data-testid="tab-learning">
+            🧪 Learning
+          </button>
+        )}
         {mode === "code" && (
           <select id="lang-select" value={lang} onChange={(e)=>setLang(e.target.value)} data-testid="lang-select">
             {LANGS.map(l => <option key={l} value={l}>{l}</option>)}
@@ -1046,7 +1159,7 @@ function MainApp() {
 
       <div id="mode-label">{MODE_LABELS[mode]}</div>
 
-      {!["queue","import","manage","visitors","access","bugs"].includes(mode) && (
+      {!["queue","import","manage","visitors","access","bugs","learning"].includes(mode) && (
         <div id="messages" data-testid="messages">
           <div className="tab-intro" data-testid={`intro-${mode}`}>
             <span className="tab-intro-pill">{ {chat:"💬",query:"🔍",research:"🌐",code:"💻"}[mode] }</span>
@@ -1318,6 +1431,71 @@ function MainApp() {
         </div>
       )}
 
+      {mode === "learning" && (
+        <div className="side-panel">
+          <div className="tab-intro" data-testid="intro-learning">
+            <span className="tab-intro-pill">🧪</span>
+            <span>{MODE_INTROS.learning}</span>
+          </div>
+          <div className="panel-card">
+            <h3>🧪 Run a learning pass</h3>
+            <div className="row-flex">
+              <input className="qinput" type="number" placeholder="How many recent messages"
+                value={learnLimit} onChange={(e)=>setLearnLimit(e.target.value)}
+                style={{ maxWidth: 200 }} data-testid="learning-limit"/>
+              <input className="qinput" type="number" placeholder="Min approval score (0-10)"
+                value={learnMinScore} onChange={(e)=>setLearnMinScore(e.target.value)}
+                style={{ maxWidth: 200 }} data-testid="learning-min-score"/>
+              <button className="qbtn" onClick={runLearningPass} disabled={learnRunning} data-testid="learning-run-btn">
+                {learnRunning ? "Judging…" : "▶ Run pass"}
+              </button>
+            </div>
+            <div className="hint">An LLM judge reads each Q+A from chat history and rates it 0–10 on helpfulness + safety. Scores ≥ {learnMinScore} are saved as approved exemplars and injected into future replies.</div>
+            {learnLastRun && (
+              <div className="hint" style={{ marginTop: 8, color: "#a6e3a1" }}>
+                Last pass: judged <b>{learnLastRun.judged}</b> · approved <b>{learnLastRun.approved}</b>
+              </div>
+            )}
+          </div>
+          <div className="panel-card">
+            <h3>📚 Saved exemplars ({exemplarsList.length})</h3>
+            <label className="check-row">
+              <input type="checkbox" checked={learnApprovedOnly}
+                onChange={(e)=>{ setLearnApprovedOnly(e.target.checked); loadExemplars(e.target.checked); }}
+                data-testid="learning-approved-only"/>
+              <span>Show only approved</span>
+            </label>
+            <div className="hint" style={{ marginTop: 0 }}>Only ✓ approved exemplars are injected into future chats (top 4 by score).</div>
+          </div>
+          <div>
+            {exemplarsList.length === 0
+              ? <div className="empty-state">No exemplars yet. Run a pass above 👆</div>
+              : exemplarsList.map(ex => (
+                <div key={ex.id} className={"kb-item" + (ex.approved ? "" : " inactive")}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div className="kb-topic">
+                      {ex.approved ? "✅" : "⚪"} Score {ex.score}/10 — {ex.username || "guest"}
+                    </div>
+                    <div className="kb-summary" style={{ marginTop: 4 }}>
+                      <b>Q:</b> {ex.question}
+                    </div>
+                    <div className="kb-summary" style={{ marginTop: 4 }}>
+                      <b>A:</b> {(ex.answer || "").slice(0, 280)}{(ex.answer || "").length > 280 ? "…" : ""}
+                    </div>
+                    {ex.reason && <div className="qi-meta" style={{ marginTop: 4 }}><span className="qi-tag" style={{ color: "#94e2d5" }}>judge: {ex.reason}</span></div>}
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <button className="copy-btn" onClick={()=>toggleExemplar(ex.id)} data-testid={`exemplar-toggle-${ex.id}`}>
+                      {ex.approved ? "Reject" : "Approve"}
+                    </button>
+                    <button className="qi-del" onClick={()=>deleteExemplar(ex.id)} data-testid={`exemplar-delete-${ex.id}`}>✕</button>
+                  </div>
+                </div>
+              ))}
+          </div>
+        </div>
+      )}
+
       {inputBarVisible && (
         <div id="input-bar">
           <div id="input-wrap" style={{ borderColor: accent + "44", boxShadow: `0 0 18px ${accent}11` }}>
@@ -1342,6 +1520,13 @@ function MainApp() {
       {pwPrompt && (
         <PasswordModal label={pwPrompt.label} onClose={pwPrompt.onClose} onUnlock={pwPrompt.onSuccess}/>
       )}
+      {showLearnGate && (
+        <LearningModal onClose={()=>setShowLearnGate(false)}
+          onUnlock={()=>{ setLearnUnlocked(true); setShowLearnGate(false); setMode("learning"); }}/>
+      )}
+      {needsGate && <GuestGate initialCode={initialGateCode} onAuthed={onGuestAuthed}/>}
+      {showInvite && <InviteDialog onClose={()=>setShowInvite(false)}/>}
+      {showBug && <BugDialog onClose={()=>setShowBug(false)} username={username}/>}
       {showHistory && <HistoryPanel onClose={()=>setShowHistory(false)} sessionId={sessionId}/>}
       {shareDlgId && <ShareDialog shareId={shareDlgId} onClose={()=>setShareDlgId(null)}/>}
       {showUsernameModal && (

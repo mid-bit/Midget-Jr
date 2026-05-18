@@ -37,6 +37,7 @@ ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
 LEARNING_PASSWORD = os.environ.get("LEARNING_PASSWORD", "AI-0verlord")
 
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "gemini").lower()
+RESEARCH_LLM_PROVIDER = os.environ.get("RESEARCH_LLM_PROVIDER", "").strip().lower() or None
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
@@ -55,6 +56,7 @@ chats = db.chat_messages
 qlog = db.question_log
 access_codes = db.access_codes
 bug_reports = db.bug_reports
+exemplars = db.exemplars
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 log = logging.getLogger("midgetjr")
@@ -142,6 +144,15 @@ class BugReportBody(BaseModel):
     steps: str
     screenshot: Optional[str] = None   # data URL, max ~500KB
     username: Optional[str] = None
+
+
+class LearningUnlockBody(BaseModel):
+    password: str
+
+
+class LearningRunBody(BaseModel):
+    limit: int = 20
+    min_score: int = 7
 
 
 class KnowledgeEntry(BaseModel):
@@ -242,44 +253,76 @@ def make_guest_token(code: str, expires_at_iso: Optional[str]) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 
+def make_learning_token() -> str:
+    payload = {
+        "role": "learning",
+        "iat": int(datetime.now(timezone.utc).timestamp()),
+        "exp": int((datetime.now(timezone.utc) + timedelta(days=30)).timestamp()),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+async def require_learning(authorization: Optional[str] = Header(None)) -> bool:
+    """Either an admin or learning-mode token unlocks Learning endpoints."""
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Learning token required")
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    if payload.get("role") not in ("admin", "learning"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return True
+
+
 # ── LLM helpers ──────────────────────────────────────────────────────────
-def _llm_config() -> tuple[str, str, str]:
-    """Return (api_key, base_url, model) for the configured provider."""
-    if LLM_PROVIDER == "gemini":
+def _llm_config(provider: Optional[str] = None) -> tuple[str, str, str]:
+    """Return (api_key, base_url, model) for the requested provider.
+    Falls back gracefully if the override provider has no key (so Gemini-only
+    setups don't break when RESEARCH_LLM_PROVIDER=groq but groq key is empty)."""
+    p = (provider or LLM_PROVIDER).lower()
+    if p == "gemini":
         if not GEMINI_API_KEY:
+            # If we were asked for an override and it's missing, fall back to default.
+            if provider and provider.lower() != LLM_PROVIDER and LLM_PROVIDER != "gemini":
+                return _llm_config(LLM_PROVIDER)
             raise RuntimeError(
                 "GEMINI_API_KEY is empty. Grab one free at https://aistudio.google.com/apikey "
                 "and add it to /app/backend/.env (no credit card needed)."
             )
         return GEMINI_API_KEY, GEMINI_BASE, GEMINI_MODEL
-    if LLM_PROVIDER == "groq":
+    if p == "groq":
         if not GROQ_API_KEY:
+            if provider and provider.lower() != LLM_PROVIDER and LLM_PROVIDER != "groq":
+                return _llm_config(LLM_PROVIDER)
             raise RuntimeError(
                 "GROQ_API_KEY is empty. Grab one free at https://console.groq.com/keys "
                 "and add it to /app/backend/.env (no credit card needed)."
             )
         return GROQ_API_KEY, GROQ_BASE, GROQ_MODEL
-    raise RuntimeError(f"Unknown LLM_PROVIDER '{LLM_PROVIDER}' — use 'gemini' or 'groq'.")
+    raise RuntimeError(f"Unknown LLM provider '{p}' — use 'gemini' or 'groq'.")
 
 
-def llm_client() -> tuple[AsyncOpenAI, str]:
-    api_key, base_url, model = _llm_config()
+def llm_client(provider: Optional[str] = None) -> tuple[AsyncOpenAI, str]:
+    api_key, base_url, model = _llm_config(provider)
     return AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=60.0), model
 
 
-async def llm_chat(messages: List[dict], temperature: float = 0.7) -> str:
-    client, model = llm_client()
-    r = await client.chat.completions.create(
+async def llm_chat(messages: List[dict], temperature: float = 0.7,
+                   provider: Optional[str] = None) -> str:
+    cli, model = llm_client(provider)
+    r = await cli.chat.completions.create(
         model=model, messages=messages, temperature=temperature
     )
     return (r.choices[0].message.content or "").strip()
 
 
-async def llm_oneshot(system: str, prompt: str) -> str:
+async def llm_oneshot(system: str, prompt: str, provider: Optional[str] = None) -> str:
     return await llm_chat([
         {"role": "system", "content": system},
         {"role": "user", "content": prompt},
-    ])
+    ], provider=provider)
 
 
 # ── Knowledge search ─────────────────────────────────────────────────────
@@ -372,7 +415,11 @@ async def do_research(topic: str, category: str = "General") -> dict:
             f"Aim for 6–10 sentences.\n\nSources:\n{joined}"
         )
         try:
-            summary = await llm_oneshot("You are a precise research assistant.", prompt)
+            summary = await llm_oneshot(
+                "You are a precise research assistant.",
+                prompt,
+                provider=RESEARCH_LLM_PROVIDER,
+            )
         except Exception as e:
             summary = f"(LLM summarization failed: {e})\n\nRaw excerpts:\n" + joined[:1500]
     else:
@@ -404,12 +451,18 @@ async def do_research(topic: str, category: str = "General") -> dict:
 async def root():
     model = GEMINI_MODEL if LLM_PROVIDER == "gemini" else GROQ_MODEL
     key_ok = bool(GEMINI_API_KEY if LLM_PROVIDER == "gemini" else GROQ_API_KEY)
+    research_provider = RESEARCH_LLM_PROVIDER or LLM_PROVIDER
+    research_key_ok = bool(
+        GEMINI_API_KEY if research_provider == "gemini" else GROQ_API_KEY
+    )
     return {
         "app": "Midget jr.",
         "ok": True,
         "provider": LLM_PROVIDER,
         "model": model,
         "key_configured": key_ok,
+        "research_provider": research_provider,
+        "research_key_configured": research_key_ok,
     }
 
 
@@ -435,6 +488,24 @@ async def chat(body: ChatBody, _guest: dict = Depends(maybe_guest)):
                 + (f"\nsource: {d['source_url']}" if d.get("source_url") else "")
             )
         context_block = "Knowledge base entries (may help):\n\n" + "\n\n".join(bits)
+
+    # Approved exemplars from Learning Mode — Q/A pairs the LLM-judge approved as
+    # genuinely helpful. Injected as few-shot examples so future answers drift toward that style.
+    exemplar_docs = await exemplars.find(
+        {"approved": True}, {"_id": 0, "question": 1, "answer": 1}
+    ).sort("score", -1).limit(4).to_list(4)
+    exemplar_block = ""
+    if exemplar_docs:
+        parts_ex = []
+        for i, d in enumerate(exemplar_docs, 1):
+            parts_ex.append(
+                f"Example {i}\nQ: {(d.get('question') or '')[:400]}\nA: {(d.get('answer') or '')[:1200]}"
+            )
+        exemplar_block = (
+            "PRIOR APPROVED ANSWERS — these are examples of the helpful, honest, "
+            "humanity-positive style you should match. Don't quote them verbatim, "
+            "match the spirit and clarity:\n\n" + "\n\n".join(parts_ex)
+        )
 
     # Behavior files — explicit instructions that change the bot's behavior
     behavior_docs = await kb.find(
@@ -491,6 +562,8 @@ async def chat(body: ChatBody, _guest: dict = Depends(maybe_guest)):
         parts.append(behavior_block)
     if style_block:
         parts.append(style_block)
+    if exemplar_block:
+        parts.append(exemplar_block)
     if context_block:
         parts.append(context_block)
     system = "\n\n".join(parts)
@@ -511,7 +584,8 @@ async def chat(body: ChatBody, _guest: dict = Depends(maybe_guest)):
     asyncio.create_task(_log_exchange(body.session_id, body.username, body.message, reply, len(ctx_docs)))
     asyncio.create_task(_maybe_auto_promote(body.message))
 
-    return {"reply": reply, "context_used": len(ctx_docs), "direct_mode": direct}
+    return {"reply": reply, "context_used": len(ctx_docs), "direct_mode": direct,
+            "exemplars_used": len(exemplar_docs)}
 
 
 async def _get_direct_mode() -> bool:
@@ -950,6 +1024,141 @@ async def run_queue_now():
     return {"processed": n}
 
 
+# ── Learning Mode (LLM-as-judge → exemplars) ────────────────────────────
+@api.post("/learning-unlock")
+async def learning_unlock(body: LearningUnlockBody):
+    if (body.password or "") != LEARNING_PASSWORD:
+        raise HTTPException(401, "Wrong learning password")
+    return {"token": make_learning_token(), "expires_in_days": 30}
+
+
+def _parse_judge_json(raw: str) -> dict:
+    """Coax the LLM-judge reply into {score: int, reason: str, approved: bool}."""
+    import json as _json
+    s = (raw or "").strip()
+    # strip markdown fences
+    s = re.sub(r"^```(?:json)?\s*", "", s)
+    s = re.sub(r"\s*```$", "", s)
+    try:
+        obj = _json.loads(s)
+    except Exception:
+        # try to extract first JSON object
+        m = re.search(r"\{[\s\S]*\}", s)
+        if not m:
+            return {"score": 0, "reason": "judge returned non-JSON", "approved": False}
+        try:
+            obj = _json.loads(m.group(0))
+        except Exception:
+            return {"score": 0, "reason": "judge returned non-JSON", "approved": False}
+    score = int(obj.get("score") or 0)
+    return {
+        "score": max(0, min(10, score)),
+        "reason": str(obj.get("reason") or "")[:500],
+        "approved": bool(obj.get("approved")) if "approved" in obj else (score >= 7),
+    }
+
+
+JUDGE_SYSTEM = (
+    "You are a strict but fair evaluator. You read a chatbot's reply to a user's question "
+    "and rate it on whether it (a) actually helps a human, (b) is honest and accurate, "
+    "(c) carries no health, safety, or wellbeing risk, and (d) is well-written and direct. "
+    "Reply ONLY with a JSON object like "
+    '{"score": 0-10, "reason": "one short sentence", "approved": true/false}. '
+    "approved=true means score >= 7 AND no harm. No prose outside JSON."
+)
+
+
+@api.post("/learning/run", dependencies=[Depends(require_learning)])
+async def learning_run(body: LearningRunBody):
+    """Pull the most recent N chat exchanges, judge each one with the LLM,
+    persist approved ones to the exemplars collection, return all judgments."""
+    n = max(1, min(int(body.limit or 20), 50))
+    min_score = max(0, min(int(body.min_score or 7), 10))
+    docs = await chats.find({}, {"_id": 0}).sort("created_at", -1).limit(n).to_list(n)
+    results: List[dict] = []
+    approved_count = 0
+    for d in docs:
+        q = (d.get("user_message") or "").strip()
+        a = (d.get("bot_reply") or "").strip()
+        if not q or not a:
+            continue
+        # Skip ones already judged
+        existing = await exemplars.find_one(
+            {"chat_id": d.get("id")}, {"_id": 0, "id": 1, "approved": 1, "score": 1}
+        )
+        if existing:
+            results.append({
+                "chat_id": d.get("id"),
+                "question": q[:200],
+                "score": existing.get("score", 0),
+                "approved": bool(existing.get("approved")),
+                "reason": "already judged",
+                "cached": True,
+            })
+            if existing.get("approved"):
+                approved_count += 1
+            continue
+        prompt = f"USER QUESTION:\n{q[:1500]}\n\nBOT ANSWER:\n{a[:3000]}"
+        try:
+            raw = await llm_oneshot(JUDGE_SYSTEM, prompt, provider=RESEARCH_LLM_PROVIDER)
+        except Exception as e:
+            results.append({"chat_id": d.get("id"), "question": q[:200],
+                            "score": 0, "approved": False, "reason": f"judge error: {e}"})
+            continue
+        verdict = _parse_judge_json(raw)
+        approved = verdict["approved"] and verdict["score"] >= min_score
+        ex_doc = {
+            "id": str(uuid.uuid4()),
+            "chat_id": d.get("id"),
+            "question": q[:2000],
+            "answer": a[:4000],
+            "score": verdict["score"],
+            "reason": verdict["reason"],
+            "approved": approved,
+            "username": d.get("username"),
+            "created_at": _now(),
+        }
+        await exemplars.insert_one(dict(ex_doc))
+        if approved:
+            approved_count += 1
+        results.append({
+            "chat_id": d.get("id"),
+            "question": q[:200],
+            "score": verdict["score"],
+            "approved": approved,
+            "reason": verdict["reason"],
+        })
+    return {"judged": len(results), "approved": approved_count, "results": results}
+
+
+@api.get("/admin/exemplars", dependencies=[Depends(require_learning)])
+async def list_exemplars(approved_only: bool = False, limit: int = 200):
+    q = {"approved": True} if approved_only else {}
+    cursor = exemplars.find(q, {"_id": 0}).sort("score", -1).limit(min(max(limit, 1), 500))
+    docs = await cursor.to_list(length=limit)
+    return {"exemplars": docs, "count": len(docs)}
+
+
+@api.delete("/admin/exemplars/{ex_id}", dependencies=[Depends(require_learning)])
+async def delete_exemplar(ex_id: str):
+    r = await exemplars.delete_one({"id": ex_id})
+    if r.deleted_count == 0:
+        raise HTTPException(404, "Not found")
+    return {"deleted": ex_id}
+
+
+@api.post("/admin/exemplars/{ex_id}/toggle", dependencies=[Depends(require_learning)])
+async def toggle_exemplar(ex_id: str):
+    """Flip approved flag — lets the admin manually approve a borderline answer or
+    reject one the judge over-rated."""
+    doc = await exemplars.find_one({"id": ex_id}, {"_id": 0, "approved": 1})
+    if not doc:
+        raise HTTPException(404, "Not found")
+    new_val = not bool(doc.get("approved"))
+    await exemplars.update_one({"id": ex_id}, {"$set": {"approved": new_val}})
+    return {"id": ex_id, "approved": new_val}
+
+
 # ── Auto-research scheduler ──────────────────────────────────────────────
 async def process_queue() -> int:
     """Process up to 5 pending queue items, oldest first."""
@@ -995,6 +1204,9 @@ async def on_startup():
     await access_codes.create_index("code", unique=True)
     await bug_reports.create_index("id", unique=True)
     await bug_reports.create_index("created_at")
+    await exemplars.create_index("id", unique=True)
+    await exemplars.create_index("approved")
+    await exemplars.create_index("chat_id")
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(process_queue, "interval", hours=6, id="auto_research",
                       next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2))
