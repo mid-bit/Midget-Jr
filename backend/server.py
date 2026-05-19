@@ -62,6 +62,7 @@ qlog = db.question_log
 access_codes = db.access_codes
 bug_reports = db.bug_reports
 exemplars = db.exemplars
+usernames = db.usernames
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 log = logging.getLogger("midgetjr")
@@ -158,6 +159,11 @@ class CreateCodeBody(BaseModel):
 
 class GuestAuthBody(BaseModel):
     code: str
+
+
+class UsernameClaimBody(BaseModel):
+    name: str
+    session_id: str
 
 
 class BugReportBody(BaseModel):
@@ -546,6 +552,68 @@ async def do_research(topic: str, category: str = "General") -> dict:
     }
 
 
+@api.post("/username/claim")
+async def claim_username(body: UsernameClaimBody):
+    """Reserve a username for this session. Names are unique across the whole app —
+    if another session already owns it, return 409 so the client can ask for a different one.
+    Names previously used in chat (but not yet claimed) are also considered taken."""
+    name = _clean_username(body.name)
+    sid = (body.session_id or "").strip()
+    if len(name) < 2 or name == "guest":
+        raise HTTPException(400, "Pick a name with at least 2 characters.")
+    if not sid:
+        raise HTTPException(400, "Missing session_id.")
+    key = name.lower()
+
+    # Already claimed by this session? idempotent yes.
+    mine = await usernames.find_one({"session_id": sid}, {"_id": 0})
+    if mine and mine.get("key") == key:
+        return {"name": name, "owned": True}
+
+    # Taken by someone else (active claim)?
+    other = await usernames.find_one({"key": key}, {"_id": 0})
+    if other and other.get("session_id") != sid:
+        raise HTTPException(409, f"'{name}' is already taken — try a different name.")
+
+    # Also block names that have been used in chat history by a different session_id
+    used_elsewhere = await chats.find_one(
+        {"username": name, "session_id": {"$ne": sid, "$nin": [None, ""]}},
+        {"_id": 0, "session_id": 1},
+    )
+    if used_elsewhere:
+        raise HTTPException(409, f"'{name}' is already used by another chatter — pick something else.")
+
+    # Release any old name this session had
+    await usernames.delete_many({"session_id": sid})
+    await usernames.insert_one(dict({
+        "key": key,
+        "name": name,
+        "session_id": sid,
+        "created_at": _now(),
+    }))
+    return {"name": name, "owned": True}
+
+
+@api.get("/username/check")
+async def check_username(name: str, session_id: str):
+    """Fast availability check (no claim). Returns {available: bool, reason?}."""
+    nm = _clean_username(name)
+    sid = (session_id or "").strip()
+    if len(nm) < 2 or nm == "guest":
+        return {"available": False, "reason": "Pick at least 2 characters."}
+    key = nm.lower()
+    other = await usernames.find_one({"key": key, "session_id": {"$ne": sid}}, {"_id": 0})
+    if other:
+        return {"available": False, "reason": "Taken by another chatter."}
+    used = await chats.find_one(
+        {"username": nm, "session_id": {"$ne": sid, "$nin": [None, ""]}},
+        {"_id": 0},
+    )
+    if used:
+        return {"available": False, "reason": "Used in chat by someone else."}
+    return {"available": True}
+
+
 # ── Routes: Public ───────────────────────────────────────────────────────
 @api.get("/")
 async def root():
@@ -820,7 +888,7 @@ async def create_share(body: ShareBody):
 
 
 @api.get("/share/{share_id}")
-async def get_share(share_id: str):
+async def get_share(share_id: str, _guest: dict = Depends(maybe_guest)):
     if not re.fullmatch(r"[a-z0-9]{4,16}", share_id or ""):
         raise HTTPException(404, "Not found")
     doc = await shares.find_one({"id": share_id}, {"_id": 0})
@@ -1379,6 +1447,8 @@ async def on_startup():
     await exemplars.create_index("id", unique=True)
     await exemplars.create_index("approved")
     await exemplars.create_index("chat_id")
+    await usernames.create_index("key", unique=True)
+    await usernames.create_index("session_id", unique=True)
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(process_queue, "interval", hours=6, id="auto_research",
                       next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2))

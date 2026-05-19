@@ -215,30 +215,40 @@ function LearningModal({ onClose, onUnlock }) {
   );
 }
 
-function UsernameModal({ initial, onSet }) {
+function UsernameModal({ initial, onSet, sessionId }) {
   const [name, setName] = useState(initial || "");
   const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
   const inputRef = useRef(null);
   useEffect(() => { inputRef.current?.focus(); }, []);
-  const submit = () => {
+  const submit = async () => {
     const n = name.trim().slice(0, 40);
     if (n.length < 2) { setErr("Pick at least 2 characters."); return; }
     if (!/^[\w \-_.]+$/.test(n)) { setErr("Letters, numbers, spaces, _ - . only."); return; }
-    localStorage.setItem(USERNAME_KEY, n);
-    onSet(n);
+    setBusy(true); setErr("");
+    try {
+      const r = await api("/username/claim", { method: "POST", body: { name: n, session_id: sessionId } });
+      localStorage.setItem(USERNAME_KEY, r.name);
+      onSet(r.name);
+    } catch (e) {
+      setErr(e.message || "Failed to claim name");
+    }
+    setBusy(false);
   };
   return (
     <div className="modal-bg">
       <div className="modal" role="dialog">
         <h2>👋 What should I call you?</h2>
-        <p>Pick a name so the admin knows who's been chatting. You can change it later from the 👤 button.</p>
+        <p>Pick a name so the admin knows who's been chatting. Names are unique — if someone already took yours, you'll need another.</p>
         <input ref={inputRef} value={name}
           onChange={(e)=>setName(e.target.value)}
           onKeyDown={(e)=>{ if(e.key==="Enter") submit(); }}
           placeholder="e.g. Alex, midget_fan_42, …" data-testid="username-input"/>
         <div className="err">{err}</div>
         <div className="actions">
-          <button className="qbtn" type="button" onClick={submit} data-testid="username-submit">Continue</button>
+          <button className="qbtn" type="button" onClick={submit} disabled={busy} data-testid="username-submit">
+            {busy ? "Checking…" : "Continue"}
+          </button>
         </div>
       </div>
     </div>
@@ -477,14 +487,46 @@ function HistoryPanel({ onClose, sessionId }) {
 function ShareViewer({ shareId }) {
   const [data, setData] = useState(null);
   const [err, setErr] = useState("");
-  useEffect(() => {
-    api(`/share/${shareId}`).then(setData).catch(e => setErr(e.message));
-  }, [shareId]);
+  const [needsGate, setNeedsGate] = useState(false);
+  const [gateCode, setGateCode] = useState("");
+
+  const load = () => api(`/share/${shareId}`).then(setData).catch(e => {
+    if (e.status === 401) { setNeedsGate(true); setErr(""); }
+    else setErr(e.message);
+  });
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, [shareId]);
+
+  const submitCode = async () => {
+    try {
+      const r = await api("/guest-auth", { method: "POST", body: { code: gateCode.trim() } });
+      localStorage.setItem(GUEST_TOKEN_KEY, r.token);
+      setNeedsGate(false);
+      load();
+    } catch (e) { setErr(e.message || "Invalid code"); }
+  };
+
   const back = () => {
     const u = new URL(window.location);
     u.searchParams.delete("share");
     window.location.href = u.pathname;
   };
+
+  if (needsGate) return (
+    <div id="app" className="share-viewer">
+      <div className="share-card empty">
+        <h2>🎟 Access required</h2>
+        <p>This Midget jr. instance is in private mode. Enter your invite code to view the shared answer.</p>
+        <input value={gateCode} onChange={(e)=>setGateCode(e.target.value)}
+          onKeyDown={(e)=>{ if(e.key==="Enter") submitCode(); }}
+          placeholder="Invite code" data-testid="share-gate-input" autoFocus
+          style={{ marginTop: 12 }}/>
+        <div className="err" style={{ marginTop: 8 }}>{err}</div>
+        <button className="qbtn" onClick={submitCode} data-testid="share-gate-submit" style={{ marginTop: 12 }}>
+          Unlock
+        </button>
+      </div>
+    </div>
+  );
   if (err) return (
     <div id="app" className="share-viewer">
       <div className="share-card empty"><h2>❌ Share not found</h2><p>{err}</p><button className="qbtn" onClick={back}>Open Midget jr.</button></div>
@@ -1620,7 +1662,7 @@ function MainApp() {
       {showHistory && <HistoryPanel onClose={()=>setShowHistory(false)} sessionId={sessionId}/>}
       {shareDlgId && <ShareDialog shareId={shareDlgId} onClose={()=>setShareDlgId(null)}/>}
       {showUsernameModal && (
-        <UsernameModal initial={username}
+        <UsernameModal initial={username} sessionId={sessionId}
           onSet={(n)=>{ setUsername(n); setShowUsernameModal(false); }}/>
       )}
     </div>
