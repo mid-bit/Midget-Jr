@@ -95,6 +95,7 @@ const getOrCreateSessionId = () => {
 };
 
 async function api(path, { method = "GET", body, auth = false, learn = false } = {}) {
+  const methodU = String(method).toUpperCase();   // belt-and-braces against case bugs
   const headers = { "Content-Type": "application/json" };
   if (learn) {
     const t = getLearnToken() || getToken();   // admin token also works for Learning endpoints
@@ -115,7 +116,7 @@ async function api(path, { method = "GET", body, auth = false, learn = false } =
   // our code gets a chance to read it. XHR isn't intercepted the same way.
   const { status, ok, text } = await new Promise((resolve) => {
     const xhr = new XMLHttpRequest();
-    xhr.open(method, `${API}${path}`, true);
+    xhr.open(methodU, `${API}${path}`, true);
     Object.entries(headers).forEach(([k, v]) => xhr.setRequestHeader(k, v));
     xhr.onload = () => resolve({ status: xhr.status, ok: xhr.status >= 200 && xhr.status < 300, text: xhr.responseText || "" });
     xhr.onerror = () => resolve({ status: 0, ok: false, text: "", networkError: true });
@@ -131,6 +132,9 @@ async function api(path, { method = "GET", body, auth = false, learn = false } =
     if (data) msg = data.detail || data.error || data.message || "";
     if (!msg && text && text.length < 500) msg = text;
     if (!msg) msg = `HTTP ${status}`;
+    if (status === 405) {
+      msg = "Your browser is running an outdated version. Press Cmd/Ctrl+Shift+R to hard-refresh.";
+    }
     const err = new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
     err.status = status;
     throw err;
