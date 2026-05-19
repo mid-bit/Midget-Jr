@@ -36,7 +36,8 @@ User uploaded a single-file HTML app **Midget jr.** (Chat / Query / Research / C
 ## What's Implemented
 - ✅ Full migration off base44 → owned FastAPI/MongoDB
 - ✅ Pluggable free LLM (Gemini default, Groq alt) via OpenAI-compatible endpoints
-- ✅ **Per-mode LLM routing**: `RESEARCH_LLM_PROVIDER=groq` keeps Research on Groq while Chat/Query/Code stay on Gemini. Falls back gracefully if the override key is missing.
+- ✅ **Per-mode LLM routing**: `RESEARCH_LLM_PROVIDER` env can override the provider just for Research. Falls back gracefully if the override key is missing.
+- ✅ **Currently running on Groq end-to-end (2026-02-19)** — `LLM_PROVIDER=groq` with `llama-3.1-8b-instant`; replaces Gemini after user hit daily quota.
 - ✅ 6 frontend tabs (Chat, Query, Research, Code, Import, Queue) + 4 admin tabs (Manage, Visitors, Access, Bugs) + Learning tab
 - ✅ Catppuccin theme, per-tab message isolation, tab intros, welcome banner
 - ✅ Persistent chat archive (5000 cap, localStorage), date-grouped history modal, export-JSON
@@ -52,6 +53,7 @@ User uploaded a single-file HTML app **Midget jr.** (Chat / Query / Research / C
 - ✅ **Friendlier LLM-quota errors (2026-02-19)** — when Gemini/Groq returns 429, the user sees "⏳ Gemini daily quota reached. Paste a Groq key into backend/.env (GROQ_API_KEY) or wait for the daily reset." instead of "HTTP 502".
 - ✅ **Rate limiting (2026-02-19)** — slowapi middleware caps every IP at 60 requests/minute globally; emits `X-RateLimit-*` headers and a friendly 429 message.
 - ✅ **Frontend `api()` helper switched from fetch → XHR (2026-02-19)** — the dev preview environment installs a global `fetch` interceptor that drains the response body before app code can read it; XHR isn't intercepted the same way, so error bodies now reach the UI.
+- ✅ **UI polish (2026-02-19)** — header redesigned with unified `.hbtn` style: pill buttons, hover lift, accent-coloured states (Direct ON = amber, Learning ON = teal, Unlocked = green), labels collapse on narrow screens. Tab pills are translucent until active, with the language/citation selector cleanly anchored right via new `.tab-pill-select` style.
 - ✅ **Bug-fix (2026-02-18)** — GuestGate, InviteDialog, BugDialog modals are now actually mounted (previously defined but never rendered in JSX).
 
 ## What's Waiting On the User

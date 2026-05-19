@@ -1152,47 +1152,46 @@ function MainApp() {
     <div id="app">
       <div id="header">
         <div className="avatar">🧠</div>
-        <div>
+        <div className="brand">
           <h1>Midget jr.</h1>
           <p>Self-growing · Research · Chat · Code</p>
         </div>
-        <button id="install-btn" onClick={()=>setShowInvite(true)} title="Invite friends with a link / QR code" data-testid="invite-btn">
-          <span>🔗</span><span>Invite</span>
+        <button className="hbtn is-invite" onClick={()=>setShowInvite(true)} title="Invite friends with a link / QR code" data-testid="invite-btn">
+          <span className="hbtn-icon">🔗</span><span className="hbtn-label">Invite</span>
         </button>
-        <button id="bug-btn" onClick={()=>setShowBug(true)} title="Report a bug" data-testid="bug-btn">
-          <span>🐛</span><span>Bug</span>
+        <button className="hbtn is-bug" onClick={()=>setShowBug(true)} title="Report a bug" data-testid="bug-btn">
+          <span className="hbtn-icon">🐛</span><span className="hbtn-label">Bug</span>
         </button>
         {installEvt && (
-          <button id="install-btn" onClick={installApp} title="Install as app" data-testid="install-btn">
-            <span>📲</span><span>Install</span>
+          <button className="hbtn is-install" onClick={installApp} title="Install as app" data-testid="install-btn">
+            <span className="hbtn-icon">📲</span><span className="hbtn-label">Install</span>
           </button>
         )}
-        <button id="username-btn" onClick={()=>setShowUsernameModal(true)} title="Change name" data-testid="username-btn">
-          <span>👤</span><span>{username || "Set name"}</span>
+        <button className="hbtn is-user" onClick={()=>setShowUsernameModal(true)} title="Change your name" data-testid="username-btn">
+          <span className="hbtn-icon">👤</span><span className="hbtn-label">{username || "Set name"}</span>
         </button>
-        <button id="history-btn" onClick={()=>setShowHistory(true)} data-testid="history-btn">
-          <span>📜</span><span>History</span>
+        <button className="hbtn is-history" onClick={()=>setShowHistory(true)} title="Chat history" data-testid="history-btn">
+          <span className="hbtn-icon">📜</span><span className="hbtn-label">History</span>
         </button>
-        <button id="lock-toggle" className={unlocked ? "unlocked" : ""} onClick={toggleLock} data-testid="lock-toggle">
-          <span>{unlocked ? "🔓" : "🔒"}</span>
-          <span>{unlocked ? "Unlocked" : "Locked"}</span>
+        <button className={"hbtn is-lock" + (unlocked ? " unlocked" : "")} onClick={toggleLock} title={unlocked ? "Admin unlocked" : "Unlock admin actions"} data-testid="lock-toggle">
+          <span className="hbtn-icon">{unlocked ? "🔓" : "🔒"}</span>
+          <span className="hbtn-label">{unlocked ? "Unlocked" : "Locked"}</span>
         </button>
         {unlocked && (
-          <button id="direct-toggle" className={directMode ? "on" : ""} onClick={toggleDirectMode} data-testid="direct-toggle" title="Direct Mode: drops disclaimers and refusals on edgy-but-legitimate topics">
-            <span>{directMode ? "⚡" : "🛡"}</span>
-            <span>{directMode ? "Direct ON" : "Direct OFF"}</span>
+          <button className={"hbtn is-direct" + (directMode ? " on" : "")} onClick={toggleDirectMode} title="Direct Mode: drops disclaimers on edgy-but-legitimate topics" data-testid="direct-toggle">
+            <span className="hbtn-icon">{directMode ? "⚡" : "🛡"}</span>
+            <span className="hbtn-label">{directMode ? "Direct ON" : "Direct OFF"}</span>
           </button>
         )}
-        <button id="learn-btn"
-          className={learnUnlocked ? "on" : ""}
+        <button className={"hbtn is-learn" + (learnUnlocked ? " on" : "")}
           onClick={learnUnlocked ? openLearningTab : ()=>setShowLearnGate(true)}
           title="Learning mode — judge past answers, save the good ones as exemplars"
           data-testid="learning-btn">
-          <span>🧪</span><span>{learnUnlocked ? "Learning" : "Learn"}</span>
+          <span className="hbtn-icon">🧪</span><span className="hbtn-label">{learnUnlocked ? "Learning" : "Learn"}</span>
         </button>
         {learnUnlocked && (
-          <button id="learn-lock-btn" className="btn-cancel" onClick={lockLearning} title="Lock learning mode" data-testid="learning-lock-btn">
-            <span>🔒</span>
+          <button className="hbtn icon-only" onClick={lockLearning} title="Lock learning mode" data-testid="learning-lock-btn">
+            <span className="hbtn-icon">🔒</span><span className="hbtn-label">Lock learn</span>
           </button>
         )}
       </div>
@@ -1231,12 +1230,12 @@ function MainApp() {
           </button>
         )}
         {mode === "code" && (
-          <select id="lang-select" value={lang} onChange={(e)=>setLang(e.target.value)} data-testid="lang-select">
+          <select className="tab-pill-select" value={lang} onChange={(e)=>setLang(e.target.value)} data-testid="lang-select">
             {LANGS.map(l => <option key={l} value={l}>{l}</option>)}
           </select>
         )}
         {mode === "chat" && (
-          <select id="lang-select" value={citationStyle}
+          <select className="tab-pill-select" value={citationStyle}
             onChange={(e)=>setCitationStyle(e.target.value)} data-testid="citation-select"
             title="Pick a citation style. Midget will quote sources and cite in this format.">
             {CITATION_STYLES.map(c => <option key={c.id} value={c.id}>📑 {c.label}</option>)}
