@@ -135,6 +135,11 @@ async function api(path, { method = "GET", body, auth = false, learn = false } =
     if (status === 405) {
       msg = "Your browser is running an outdated version. Press Cmd/Ctrl+Shift+R to hard-refresh.";
     }
+    // Self-heal: an old/expired guest token in localStorage causes 401 on every
+    // request. Purge it so the next page load re-prompts for a fresh code.
+    if (status === 401 && /guest|expired|revoked/i.test(msg)) {
+      localStorage.removeItem(GUEST_TOKEN_KEY);
+    }
     const err = new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
     err.status = status;
     throw err;
@@ -826,10 +831,32 @@ function MainApp() {
     const codeParam = u.searchParams.get("code");
     if (codeParam) setInitialGateCode(codeParam);
 
-    api("/access-mode").then(r => {
+    api("/access-mode").then(async r => {
       setAccessMode(!!r.require_guest_pass);
-      if (r.require_guest_pass && !localStorage.getItem(GUEST_TOKEN_KEY) && !getToken()) {
-        setNeedsGate(true);
+      if (r.require_guest_pass) {
+        const gtok = localStorage.getItem(GUEST_TOKEN_KEY);
+        const admin = getToken();
+        // Validate any stashed guest token by hitting a cheap gated endpoint.
+        // If it's expired/revoked, nuke it and show the gate.
+        let tokenValid = !!admin;
+        if (!tokenValid && gtok) {
+          try {
+            await api("/direct-mode");   // requires guest pass when private mode on
+            tokenValid = true;
+          } catch (e) {
+            if (e.status === 401) {
+              localStorage.removeItem(GUEST_TOKEN_KEY);
+              tokenValid = false;
+            } else {
+              tokenValid = true;  // network glitch — don't lock the user out
+            }
+          }
+        }
+        if (!tokenValid) setNeedsGate(true);
+      } else {
+        // Private mode OFF — any leftover guest token from a previous session
+        // is useless and would only cause 401s if we keep sending it. Purge.
+        localStorage.removeItem(GUEST_TOKEN_KEY);
       }
     }).catch(() => setAccessMode(false));
   }, []);
