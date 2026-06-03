@@ -30,7 +30,7 @@ const MODE_COLORS = {
   chat: "#f38ba8", query: "#89b4fa", research: "#a6e3a1",
   code: "#cba6f7", import: "#fab387", queue: "#f9e2af",
   visitors: "#74c7ec", manage: "#f5c2e7", learning: "#94e2d5",
-  write: "#f5e0dc",
+  write: "#f5e0dc", self: "#eba0ac",
 };
 const MODE_LABELS = {
   chat: "💬 Chat — ask me anything, I'll use my knowledge base + AI",
@@ -63,6 +63,7 @@ const MODE_INTROS = {
   access: "Generate invite codes for friends, set expirations, and revoke access. Flip 'Private mode' on to require a code before anyone can chat.",
   bugs: "Bug reports submitted by visitors via the 🐛 Bug button in the header. Includes screenshots if attached.",
   learning: "Reinforcement-by-judging. Run a pass and an LLM judge rates each past answer on whether it helps humanity and carries no health risk. Approved Q+A pairs become in-context exemplars that future replies imitate.",
+  self: "⚠️ Self-edit zone. Pick a file, describe a change in plain English, preview the diff, then apply. Every edit is backed up — you can roll back one click. Push to GitHub once you've added your PAT.",
 };
 
 const WELCOME_DISMISS_KEY = "mj_welcome_dismissed";
@@ -839,6 +840,21 @@ function MainApp() {
   const [codeCustom, setCodeCustom] = useState("");
   const [codeComplexity, setCodeComplexity] = useState("weak");
 
+  // Self-edit (admin)
+  const [selfFiles, setSelfFiles] = useState([]);
+  const [selfPath, setSelfPath] = useState("");
+  const [selfInstruction, setSelfInstruction] = useState("");
+  const [selfBusy, setSelfBusy] = useState(false);
+  const [selfStatus, setSelfStatus] = useState("");
+  const [selfDiff, setSelfDiff] = useState(null);    // {path, diff, new_content, old_size, new_size}
+  const [selfHistory, setSelfHistory] = useState([]);
+  const [ghStatus, setGhStatus] = useState(null);
+  const [ghPat, setGhPat] = useState("");
+  const [ghRepo, setGhRepo] = useState("");
+  const [ghBranch, setGhBranch] = useState("main");
+  const [ghCommit, setGhCommit] = useState("Midget jr. self-edit");
+  const [ghLog, setGhLog] = useState("");
+
   // Visitors
   const [visitors, setVisitors] = useState([]);
   const [chatLog, setChatLog] = useState([]);
@@ -859,6 +875,7 @@ function MainApp() {
     if (mode === "visitors" && unlocked) loadVisitors();
     if (mode === "access" && unlocked) loadAccess();
     if (mode === "bugs" && unlocked) loadBugs();
+    if (mode === "self" && unlocked) { loadSelfFiles(); loadSelfHistory(); loadGhStatus(); }
     if (mode === "learning" && (learnUnlocked || unlocked)) loadExemplars();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, unlocked, learnUnlocked]);
@@ -1413,6 +1430,100 @@ function MainApp() {
     a.click();
     URL.revokeObjectURL(a.href);
   };
+
+  // ── Self-edit helpers ─────────────────────────────────────────────
+  const loadSelfFiles = async () => {
+    try {
+      const r = await api("/admin/self/files", { auth: true });
+      setSelfFiles(r.files || []);
+      if (!selfPath && r.files?.length) setSelfPath(r.files[0].path);
+    } catch (e) { alert("Failed: " + e.message); }
+  };
+  const loadSelfHistory = async () => {
+    try {
+      const r = await api("/admin/self/history", { auth: true });
+      setSelfHistory(r.edits || []);
+    } catch (e) { console.warn(e); }
+  };
+  const loadGhStatus = async () => {
+    try {
+      const r = await api("/admin/github/status", { auth: true });
+      setGhStatus(r);
+      if (r.repo) setGhRepo(r.repo);
+      if (r.branch) setGhBranch(r.branch);
+    } catch (e) { console.warn(e); }
+  };
+  const proposeSelfEdit = async () => {
+    if (!selfPath) { setSelfStatus("Pick a file first."); return; }
+    if (!selfInstruction.trim()) { setSelfStatus("Describe what to change first."); return; }
+    setSelfBusy(true); setSelfStatus("✍️ Drafting…"); setSelfDiff(null);
+    try {
+      const r = await api("/admin/self/propose", { method: "POST", auth: true,
+        body: { path: selfPath, instruction: selfInstruction } });
+      setSelfDiff(r);
+      setSelfStatus(`Drafted: ${r.old_size} → ${r.new_size} chars. Review the diff and click Apply if it looks right.`);
+    } catch (e) {
+      setSelfStatus("❌ " + (e.message || "Failed"));
+    }
+    setSelfBusy(false);
+  };
+  const applySelfEdit = async () => {
+    if (!selfDiff) return;
+    if (!window.confirm(
+      `Apply this edit to ${selfDiff.path}?\n\n` +
+      `(${selfDiff.old_size} → ${selfDiff.new_size} chars. Old version is backed up — you can roll back.)`
+    )) return;
+    setSelfBusy(true); setSelfStatus("⏳ Applying…");
+    try {
+      const r = await api("/admin/self/apply", { method: "POST", auth: true,
+        body: { path: selfDiff.path, new_content: selfDiff.new_content, summary: selfInstruction } });
+      if (r.applied) {
+        setSelfStatus(`✅ Applied to ${r.path}. Hot reload should pick it up in a moment.`);
+        setSelfDiff(null);
+        loadSelfFiles();
+        loadSelfHistory();
+      } else {
+        setSelfStatus("ℹ️ " + (r.reason || "No change."));
+      }
+    } catch (e) {
+      setSelfStatus("❌ " + (e.message || "Failed"));
+    }
+    setSelfBusy(false);
+  };
+  const rollbackSelfEdit = async (id) => {
+    if (!window.confirm("Roll back this edit?")) return;
+    setSelfBusy(true);
+    try {
+      await api(`/admin/self/rollback/${id}`, { method: "POST", auth: true });
+      setSelfStatus("⏪ Rolled back.");
+      loadSelfHistory();
+    } catch (e) {
+      setSelfStatus("❌ " + e.message);
+    }
+    setSelfBusy(false);
+  };
+  const setupGithub = async () => {
+    if (!ghPat || !ghRepo) { setSelfStatus("Need both a PAT and a repo (owner/repo)."); return; }
+    try {
+      await api("/admin/github/setup", { method: "POST", auth: true,
+        body: { pat: ghPat, repo: ghRepo, branch: ghBranch || "main" } });
+      setSelfStatus("✅ GitHub saved.");
+      setGhPat("");
+      loadGhStatus();
+    } catch (e) { setSelfStatus("❌ " + e.message); }
+  };
+  const pushGithub = async () => {
+    if (!window.confirm(`Push current code to GitHub (${ghRepo}@${ghBranch})?`)) return;
+    setSelfBusy(true); setSelfStatus("⤴ Pushing…"); setGhLog("");
+    try {
+      const r = await api("/admin/github/push", { method: "POST", auth: true,
+        body: { message: ghCommit } });
+      setGhLog(r.log || "");
+      setSelfStatus(r.pushed ? "✅ Pushed!" : "❌ " + (r.reason || "Push failed"));
+      loadGhStatus();
+    } catch (e) { setSelfStatus("❌ " + e.message); }
+    setSelfBusy(false);
+  };
   useEffect(() => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     if (mode === "visitors" && unlocked) loadVisitors();
@@ -1487,7 +1598,7 @@ function MainApp() {
   };
 
   const inputBarVisible = ["chat","query","research","code"].includes(mode);
-  const adminTabs = ["import", "manage", "queue", "visitors", "access", "bugs"];
+  const adminTabs = ["import", "manage", "queue", "visitors", "access", "bugs", "self"];
   const visibleAdmin = unlocked ? adminTabs : [];
   const showLearningTab = learnUnlocked || unlocked;
 
@@ -1563,7 +1674,7 @@ function MainApp() {
         ))}
         {visibleAdmin.map(m => (
           <button key={m} className={"tab admin-tab" + (mode === m ? ` active-${m}` : "")} onClick={()=>setMode(m)} data-testid={`tab-${m}`}>
-            {{import:"📂 Import",manage:"🗂 Manage",queue:"📋 Queue",visitors:"👥 Visitors",access:"🎟 Access",bugs:"🐛 Bugs"}[m]}
+            {{import:"📂 Import",manage:"🗂 Manage",queue:"📋 Queue",visitors:"👥 Visitors",access:"🎟 Access",bugs:"🐛 Bugs",self:"🛠 Self"}[m]}
           </button>
         ))}
         {showLearningTab && (
@@ -1588,7 +1699,7 @@ function MainApp() {
 
       <div id="mode-label">{MODE_LABELS[mode]}</div>
 
-      {!["queue","import","manage","visitors","access","bugs","learning","write"].includes(mode) && (
+      {!["queue","import","manage","visitors","access","bugs","learning","write","self"].includes(mode) && (
         <div id="messages" data-testid="messages">
           <div className="tab-intro" data-testid={`intro-${mode}`}>
             <span className="tab-intro-pill">{ {chat:"💬",query:"🔍",research:"🌐",code:"💻"}[mode] }</span>
@@ -1600,6 +1711,128 @@ function MainApp() {
           {messages.map((m, i) => <Bubble key={i} msg={m} onShare={onShareBubble} onTeach={onTeachBubble}/>)}
           {typing && <Typing/>}
           <div ref={messagesEnd}/>
+        </div>
+      )}
+
+      {mode === "self" && (
+        <div className="side-panel" data-testid="self-tab">
+          <div className="tab-intro" data-testid="intro-self">
+            <span className="tab-intro-pill">🛠</span>
+            <span>{MODE_INTROS.self}</span>
+          </div>
+
+          <div className="panel-card">
+            <h3>📁 Pick a file to edit</h3>
+            <select className="qselect" value={selfPath}
+              onChange={(e)=>{ setSelfPath(e.target.value); setSelfDiff(null); }}
+              data-testid="self-file-select"
+              style={{ width: "100%" }}>
+              {selfFiles.map(f => (
+                <option key={f.path} value={f.path}>{f.path} — {f.lines} lines · {(f.size/1024).toFixed(1)} KB</option>
+              ))}
+            </select>
+            {selfPath && (
+              <div className="hint" style={{ marginTop: 6 }}>
+                {selfFiles.find(f => f.path === selfPath)?.description}
+              </div>
+            )}
+          </div>
+
+          <div className="panel-card">
+            <h3>📝 Describe the change in plain English</h3>
+            <textarea className="qinput"
+              value={selfInstruction}
+              onChange={(e)=>setSelfInstruction(e.target.value)}
+              placeholder="e.g. 'Add a /api/health endpoint that returns {ok: true, uptime: process.uptime()}' or 'In App.css, change the chat tab pill color from pink to teal'"
+              data-testid="self-instruction"
+              rows={3}
+              style={{ width: "100%", resize: "vertical" }}/>
+            <div className="row-flex" style={{ marginTop: 8 }}>
+              <button className="qbtn" onClick={proposeSelfEdit} disabled={selfBusy} data-testid="self-propose-btn">
+                {selfBusy ? "…" : "✍️ Draft change"}
+              </button>
+              {selfDiff && (
+                <button className="qbtn" onClick={applySelfEdit} disabled={selfBusy}
+                  style={{ background: "var(--green)", color: "var(--panel)" }}
+                  data-testid="self-apply-btn">
+                  ✅ Apply edit
+                </button>
+              )}
+            </div>
+            {selfStatus && (
+              <div className="hint" style={{ marginTop: 8,
+                color: selfStatus.startsWith("❌") ? "var(--pink)"
+                     : selfStatus.startsWith("✅") ? "var(--green)"
+                     : "var(--sub)" }}>
+                {selfStatus}
+              </div>
+            )}
+          </div>
+
+          {selfDiff && (
+            <div className="panel-card">
+              <h3>👀 Diff preview <span style={{ fontWeight: 400, color: "var(--muted)", fontSize: 11 }}>{selfDiff.path}</span></h3>
+              <pre className="diff-pre" data-testid="self-diff-view">
+                {selfDiff.diff || "(no textual diff produced)"}
+              </pre>
+            </div>
+          )}
+
+          <div className="panel-card">
+            <h3>⤴ Push to GitHub</h3>
+            {ghStatus && ghStatus.configured && (
+              <div className="hint" style={{ marginBottom: 8 }}>
+                Configured: <b>{ghStatus.repo}</b>@{ghStatus.branch}
+                {ghStatus.dirty ? " · 🟡 uncommitted changes" : " · ✓ clean"}
+              </div>
+            )}
+            <div className="row-flex">
+              <input className="qinput" placeholder="owner/repo"
+                value={ghRepo} onChange={(e)=>setGhRepo(e.target.value)}
+                data-testid="gh-repo-input"/>
+              <input className="qinput" placeholder="branch (main)"
+                value={ghBranch} onChange={(e)=>setGhBranch(e.target.value)}
+                data-testid="gh-branch-input" style={{ maxWidth: 140 }}/>
+            </div>
+            <div className="row-flex" style={{ marginTop: 8 }}>
+              <input className="qinput" type="password"
+                placeholder="GitHub PAT (ghp_... or fine-grained)"
+                value={ghPat} onChange={(e)=>setGhPat(e.target.value)}
+                data-testid="gh-pat-input" autoComplete="off"/>
+              <button className="qbtn" onClick={setupGithub} data-testid="gh-setup-btn">💾 Save PAT</button>
+            </div>
+            <div className="hint" style={{ marginTop: 6 }}>
+              Get a PAT at <code>github.com/settings/tokens</code>. Needs <code>repo</code> scope (or <code>contents:write</code> for fine-grained). The token is stored only in your MongoDB.
+            </div>
+            <div className="row-flex" style={{ marginTop: 12 }}>
+              <input className="qinput" placeholder="Commit message"
+                value={ghCommit} onChange={(e)=>setGhCommit(e.target.value)}
+                data-testid="gh-commit-input"/>
+              <button className="qbtn" onClick={pushGithub} disabled={selfBusy || !ghStatus?.configured}
+                style={{ background: "var(--purple)" }} data-testid="gh-push-btn">
+                ⤴ Push now
+              </button>
+            </div>
+            {ghLog && <pre className="diff-pre" style={{ marginTop: 8, maxHeight: 220 }}>{ghLog}</pre>}
+          </div>
+
+          <div className="panel-card">
+            <h3>⏪ Edit history ({selfHistory.length})</h3>
+            {selfHistory.length === 0
+              ? <div className="empty-state">No self-edits yet.</div>
+              : selfHistory.map(h => (
+                <div key={h.id} className="kb-item">
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div className="kb-topic">{h.path}</div>
+                    <div className="kb-summary">{h.summary || "(no summary)"}</div>
+                    <div className="qi-meta">
+                      <span className="qi-tag" style={{ color: "#6c7086" }}>{new Date(h.created_at).toLocaleString()}</span>
+                    </div>
+                  </div>
+                  <button className="copy-btn" onClick={()=>rollbackSelfEdit(h.id)} data-testid={`self-rollback-${h.id}`}>⏪ Rollback</button>
+                </div>
+              ))}
+          </div>
         </div>
       )}
 

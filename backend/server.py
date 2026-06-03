@@ -64,6 +64,7 @@ access_codes = db.access_codes
 bug_reports = db.bug_reports
 exemplars = db.exemplars
 usernames = db.usernames
+self_edits = db.self_edits      # audit log of admin self-edits (file backups + diffs)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 log = logging.getLogger("midgetjr")
@@ -178,6 +179,29 @@ class RewriteBody(BaseModel):
     doc_before: str = ""
     doc_after: str = ""
     max_chars: int = 2000
+
+
+class SelfProposeBody(BaseModel):
+    path: str
+    instruction: str
+
+
+class SelfApplyBody(BaseModel):
+    path: str
+    new_content: str
+    summary: Optional[str] = None
+
+
+class GithubSetupBody(BaseModel):
+    pat: str                # GitHub personal access token (classic or fine-grained with repo write)
+    repo: str               # "owner/repo"
+    branch: str = "main"
+    author_name: Optional[str] = "Midget jr."
+    author_email: Optional[str] = "midget-jr@local"
+
+
+class GithubPushBody(BaseModel):
+    message: str = "Midget jr. self-edit"
 
 
 class GuestAuthBody(BaseModel):
@@ -1583,6 +1607,266 @@ async def learning_teach(body: TeachBody, _guest: dict = Depends(maybe_guest)):
             "approved": approved, "reason": verdict["reason"]}
 
 
+# ── Self-edit (admin can let Midget rewrite its own source) ──────────
+# ⚠️ Tight safety rails — admin-only, path allow-list, automatic backup, no
+# secrets-leaking responses. Hot-reload picks up changes; no restart needed.
+import difflib  # noqa: E402
+
+APP_ROOT = "/app"
+EDITABLE_PATHS = {
+    # Backend
+    "backend/server.py": "Backend FastAPI app + LLM logic",
+    # Frontend
+    "frontend/src/App.js": "Main React SPA (all UI, tabs, modals)",
+    "frontend/src/App.css": "App stylesheet",
+    "frontend/src/index.css": "Global CSS reset + Catppuccin palette",
+    "frontend/src/index.js": "React entrypoint",
+}
+
+
+def _abs(rel: str) -> str:
+    if rel not in EDITABLE_PATHS:
+        raise HTTPException(403, f"Path '{rel}' is not in the safe-edit allow-list.")
+    return os.path.join(APP_ROOT, rel)
+
+
+def _read_file(rel: str) -> str:
+    with open(_abs(rel), "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _write_file(rel: str, content: str) -> None:
+    with open(_abs(rel), "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+@api.get("/admin/self/files", dependencies=[Depends(require_admin)])
+async def list_editable_files():
+    out = []
+    for rel, desc in EDITABLE_PATHS.items():
+        try:
+            sz = os.path.getsize(_abs(rel))
+            lines = _read_file(rel).count("\n") + 1
+        except Exception:
+            sz, lines = 0, 0
+        out.append({"path": rel, "description": desc, "size": sz, "lines": lines})
+    return {"files": out}
+
+
+@api.get("/admin/self/file", dependencies=[Depends(require_admin)])
+async def read_editable_file(path: str):
+    return {"path": path, "content": _read_file(path)}
+
+
+@api.post("/admin/self/propose", dependencies=[Depends(require_admin)])
+async def propose_edit(body: SelfProposeBody):
+    rel = body.path
+    if rel not in EDITABLE_PATHS:
+        raise HTTPException(403, "Path not editable.")
+    current = _read_file(rel)
+    is_python = rel.endswith(".py")
+    is_react = rel.endswith(".js") or rel.endswith(".jsx")
+    lang = "Python (FastAPI)" if is_python else ("React JSX" if is_react else "CSS")
+    system = (
+        f"You are a {lang} expert editing the source file '{rel}' of an existing "
+        "running web app called Midget jr. (FastAPI backend + React frontend + MongoDB). "
+        "The user (admin) describes a change they want. You return the COMPLETE NEW "
+        "FILE CONTENT — no markdown fences, no diff, no commentary, no truncation. "
+        "Preserve all existing functionality except what the user asked to change. "
+        "Keep imports correct. Keep route paths under /api. Keep MongoDB queries that "
+        "exclude _id. Don't touch unrelated code. The output must be a syntactically "
+        "complete file ready to be saved as-is."
+    )
+    prompt = (
+        f"USER REQUEST:\n{body.instruction}\n\n"
+        f"CURRENT FILE CONTENT (length {len(current)} chars):\n"
+        f"------BEGIN------\n{current}\n------END------\n\n"
+        "Now output the entire new file content:"
+    )
+    try:
+        new_content = await llm_oneshot(system, prompt)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"LLM error: {e}") from e
+    # Strip accidental fences
+    new_content = re.sub(r"^```[a-zA-Z0-9]*\n", "", new_content.strip())
+    new_content = re.sub(r"\n```$", "", new_content)
+    # Diff for preview
+    diff = "".join(difflib.unified_diff(
+        current.splitlines(keepends=True),
+        new_content.splitlines(keepends=True),
+        fromfile=f"a/{rel}", tofile=f"b/{rel}", n=3,
+    ))
+    return {
+        "path": rel,
+        "new_content": new_content,
+        "diff": diff,
+        "old_size": len(current),
+        "new_size": len(new_content),
+    }
+
+
+@api.post("/admin/self/apply", dependencies=[Depends(require_admin)])
+async def apply_edit(body: SelfApplyBody):
+    rel = body.path
+    if rel not in EDITABLE_PATHS:
+        raise HTTPException(403, "Path not editable.")
+    if not body.new_content or len(body.new_content) < 10:
+        raise HTTPException(400, "Refusing to write an empty or trivial file.")
+    current = _read_file(rel)
+    if current == body.new_content:
+        return {"applied": False, "reason": "No change vs current file."}
+    # Backup old version to audit log (capped at 200 backups)
+    edit_doc = {
+        "id": str(uuid.uuid4()),
+        "path": rel,
+        "old_content": current,
+        "new_content": body.new_content,
+        "summary": (body.summary or "")[:300],
+        "created_at": _now(),
+    }
+    await self_edits.insert_one(dict(edit_doc))
+    # Rotate: keep only most recent 200
+    too_many = await self_edits.count_documents({})
+    if too_many > 200:
+        oldest = await self_edits.find({}, {"_id": 1}).sort("created_at", 1).limit(too_many - 200).to_list(too_many - 200)
+        if oldest:
+            await self_edits.delete_many({"_id": {"$in": [o["_id"] for o in oldest]}})
+    _write_file(rel, body.new_content)
+    return {"applied": True, "edit_id": edit_doc["id"], "path": rel,
+            "new_size": len(body.new_content)}
+
+
+@api.get("/admin/self/history", dependencies=[Depends(require_admin)])
+async def self_edit_history(limit: int = 30):
+    docs = await self_edits.find(
+        {}, {"_id": 0, "id": 1, "path": 1, "summary": 1, "created_at": 1}
+    ).sort("created_at", -1).limit(min(max(limit, 1), 100)).to_list(limit)
+    return {"edits": docs, "count": len(docs)}
+
+
+@api.post("/admin/self/rollback/{edit_id}", dependencies=[Depends(require_admin)])
+async def rollback_edit(edit_id: str):
+    doc = await self_edits.find_one({"id": edit_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Edit not found")
+    rel = doc["path"]
+    if rel not in EDITABLE_PATHS:
+        raise HTTPException(403, "Path no longer editable.")
+    current = _read_file(rel)
+    # Insert a rollback record (so the rollback itself is reversible)
+    await self_edits.insert_one(dict({
+        "id": str(uuid.uuid4()),
+        "path": rel,
+        "old_content": current,
+        "new_content": doc["old_content"],
+        "summary": f"Rollback of {edit_id}",
+        "created_at": _now(),
+    }))
+    _write_file(rel, doc["old_content"])
+    return {"rolled_back": edit_id, "path": rel}
+
+
+# ── GitHub push (admin commits the current /app to a configured repo) ──
+import subprocess  # noqa: E402
+
+GIT_CONFIG_KEY = "github_settings"
+
+
+def _git(args: List[str], cwd: str = APP_ROOT) -> subprocess.CompletedProcess:
+    return subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True, timeout=60)
+
+
+@api.post("/admin/github/setup", dependencies=[Depends(require_admin)])
+async def github_setup(body: GithubSetupBody):
+    if not re.fullmatch(r"[\w.\-]+/[\w.\-]+", body.repo):
+        raise HTTPException(400, "Repo must look like 'owner/repo'.")
+    if len(body.pat) < 20:
+        raise HTTPException(400, "That PAT looks too short to be valid.")
+    await config.update_one(
+        {"_id": GIT_CONFIG_KEY},
+        {"$set": {
+            "repo": body.repo,
+            "branch": body.branch or "main",
+            "pat": body.pat,
+            "author_name": body.author_name or "Midget jr.",
+            "author_email": body.author_email or "midget-jr@local",
+            "updated_at": _now(),
+        }},
+        upsert=True,
+    )
+    return {"ok": True, "repo": body.repo, "branch": body.branch}
+
+
+@api.get("/admin/github/status", dependencies=[Depends(require_admin)])
+async def github_status():
+    cfg = await config.find_one({"_id": GIT_CONFIG_KEY}, {"_id": 0})
+    is_repo = os.path.isdir(os.path.join(APP_ROOT, ".git"))
+    out = {"configured": bool(cfg), "is_git_repo": is_repo}
+    if cfg:
+        out.update({"repo": cfg.get("repo"), "branch": cfg.get("branch"),
+                    "pat_set": bool(cfg.get("pat"))})
+    if is_repo:
+        st = _git(["status", "--short"])
+        out["dirty"] = bool(st.stdout.strip())
+        out["status"] = st.stdout[-2000:]
+    return out
+
+
+@api.post("/admin/github/push", dependencies=[Depends(require_admin)])
+async def github_push(body: GithubPushBody):
+    cfg = await config.find_one({"_id": GIT_CONFIG_KEY}, {"_id": 0})
+    if not cfg or not cfg.get("pat"):
+        raise HTTPException(400, "GitHub not configured — call /admin/github/setup first.")
+    branch = cfg.get("branch", "main")
+    repo = cfg.get("repo")
+    pat = cfg.get("pat")
+    name = cfg.get("author_name") or "Midget jr."
+    email = cfg.get("author_email") or "midget-jr@local"
+    remote = f"https://x-access-token:{pat}@github.com/{repo}.git"
+
+    logs: List[str] = []
+    def step(name: str, args: List[str], **kw):
+        p = _git(args, **kw)
+        logs.append(f"$ git {' '.join(args)}\n{p.stdout}{p.stderr}".strip())
+        return p
+
+    try:
+        # Init if needed
+        if not os.path.isdir(os.path.join(APP_ROOT, ".git")):
+            step("init", ["init"])
+            step("branch", ["branch", "-M", branch])
+        step("name", ["config", "user.name", name])
+        step("email", ["config", "user.email", email])
+        # Make sure .gitignore exists to avoid leaking secrets
+        gi = os.path.join(APP_ROOT, ".gitignore")
+        if not os.path.exists(gi):
+            with open(gi, "w") as f:
+                f.write(
+                    "# auto-generated by Midget jr.\n"
+                    "backend/.env\nfrontend/.env\nnode_modules/\n__pycache__/\n*.pyc\n.DS_Store\n"
+                    ".emergent/\n"
+                )
+        step("add", ["add", "-A"])
+        diff_check = step("diff_check", ["diff", "--cached", "--quiet"])
+        if diff_check.returncode == 0:
+            return {"pushed": False, "reason": "Nothing to commit.", "log": "\n\n".join(logs)}
+        step("commit", ["commit", "-m", body.message[:200] or "Midget jr. self-edit"])
+        step("remote_set", ["remote", "remove", "origin"])  # ok if it errors
+        step("remote_add", ["remote", "add", "origin", remote])
+        push = step("push", ["push", "-u", "origin", branch])
+        if push.returncode != 0:
+            # Try force? No — return the error so admin sees it.
+            return {"pushed": False, "reason": "git push failed",
+                    "log": "\n\n".join(logs).replace(pat, "***REDACTED***")}
+        return {"pushed": True, "branch": branch, "repo": repo,
+                "log": "\n\n".join(logs).replace(pat, "***REDACTED***")}
+    except Exception as e:
+        return {"pushed": False, "reason": str(e),
+                "log": "\n\n".join(logs).replace(pat, "***REDACTED***")}
+
+
 # ── Auto-research scheduler ──────────────────────────────────────────────
 async def process_queue() -> int:
     """Process up to 5 pending queue items, oldest first."""
@@ -1633,6 +1917,8 @@ async def on_startup():
     await exemplars.create_index("chat_id")
     await usernames.create_index("key", unique=True)
     await usernames.create_index("session_id", unique=True)
+    await self_edits.create_index("id", unique=True)
+    await self_edits.create_index("created_at")
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(process_queue, "interval", hours=6, id="auto_research",
                       next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2))
