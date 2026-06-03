@@ -333,7 +333,10 @@ function Bubble({ msg, onShare, onTeach }) {
   if (msg.role === "user") {
     return (
       <div className="msg-row user">
-        <div className="bubble user">{msg.content}</div>
+        <div className="bubble user">
+          {msg.image && <img src={msg.image} alt="attachment" className="bubble-img"/>}
+          {msg.content}
+        </div>
         <div className="bubble-avatar user">{(msg.username || "U")[0].toUpperCase()}</div>
       </div>
     );
@@ -447,6 +450,26 @@ function HistoryPanel({ onClose, sessionId }) {
     const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     downloadText(`midget-chat-${tab}-${ts}.json`, JSON.stringify(items, null, 2), "application/json");
   };
+  const onExportMarkdown = () => {
+    if (!items.length) return;
+    const lines = [`# Midget jr. chat export`, ``, `_Exported ${new Date().toLocaleString()} · ${tab === "local" ? "this device" : "all sessions"}_`, ``];
+    for (const m of items) {
+      const t = m.at ? new Date(m.at).toLocaleString() : "";
+      if (m.role === "user") {
+        lines.push(`### 🧑 ${m.username || "you"} · ${t}`);
+        lines.push("");
+        lines.push("> " + (m.content || "").replace(/\n/g, "\n> "));
+        lines.push("");
+      } else {
+        lines.push(`### 🧠 Midget jr. · ${m.mode || "chat"} · ${t}`);
+        lines.push("");
+        lines.push(m.content || "");
+        lines.push("");
+      }
+    }
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    downloadText(`midget-chat-${tab}-${ts}.md`, lines.join("\n"), "text/markdown");
+  };
 
   return (
     <div className="modal-bg" onClick={(e)=>{ if(e.target.classList.contains("modal-bg")) onClose(); }}>
@@ -479,6 +502,7 @@ function HistoryPanel({ onClose, sessionId }) {
         </div>
         <div className="actions">
           <button className="btn-cancel" type="button" onClick={onExport}>⬇ Export JSON</button>
+          <button className="btn-cancel" type="button" onClick={onExportMarkdown} data-testid="export-md-btn">📄 Export .md</button>
           {tab === "local" && <button className="btn-cancel" type="button" onClick={onClearLocal} style={{ color: "#f38ba8" }}>Clear device</button>}
           <button className="qbtn" type="button" onClick={onClose}>Close</button>
         </div>
@@ -802,6 +826,15 @@ function MainApp() {
   const docRef = useRef(null);
   useEffect(() => { localStorage.setItem("mj_doc", doc); }, [doc]);
 
+  // Image attach (vision)
+  const [attachedImage, setAttachedImage] = useState(null); // data URL
+  const [attachedImageMeta, setAttachedImageMeta] = useState(null); // {name, size}
+
+  // Voice input (Web Speech API)
+  const [listening, setListening] = useState(false);
+  const recognitionRef = useRef(null);
+  const voiceTargetRef = useRef("chat");  // "chat" or "write"
+
   // Access tab additions
   const [codeCustom, setCodeCustom] = useState("");
   const [codeComplexity, setCodeComplexity] = useState("weak");
@@ -910,7 +943,7 @@ function MainApp() {
 
   // Push helpers that write to the *current* mode's bucket
   const pushBot = (b) => setMessagesByMode(s => ({ ...s, [mode]: [...(s[mode]||[]), { role: "bot", ...b }] }));
-  const pushUser = (t) => setMessagesByMode(s => ({ ...s, [mode]: [...(s[mode]||[]), { role: "user", content: t, username }] }));
+  const pushUser = (t, extra = {}) => setMessagesByMode(s => ({ ...s, [mode]: [...(s[mode]||[]), { role: "user", content: t, username, ...extra }] }));
   const pushBotIn = (m, b) => setMessagesByMode(s => ({ ...s, [m]: [...(s[m]||[]), { role: "bot", ...b }] }));
 
   const archive = (entries) => {
@@ -925,16 +958,21 @@ function MainApp() {
     if (!t || typing) return;
     if (!username) { setShowUsernameModal(true); return; }
     setText(""); if (taRef.current) taRef.current.style.height = "auto";
-    pushUser(t);
+    pushUser(t, attachedImage && mode === "chat" ? { image: attachedImage } : {});
     setTyping(true);
     const now = new Date().toISOString();
     const archiveBuf = [{ role: "user", content: t, mode, username, at: now }];
     try {
       if (mode === "chat") {
-        const r = await api("/chat", { method: "POST", body: { message: t, history, session_id: sessionId, username, citation_style: citationStyle } });
+        const r = await api("/chat", { method: "POST", body: {
+          message: t, history, session_id: sessionId, username,
+          citation_style: citationStyle,
+          image: attachedImage || undefined,
+        }});
         pushBotIn("chat", { content: r.reply, ctx: r.context_used, exemplarsUsed: r.exemplars_used || 0,
-          lastUserQuestion: t, mode: "chat", citationStyle: r.citation_style });
+          lastUserQuestion: t, mode: "chat", citationStyle: r.citation_style, vision: !!r.vision });
         archiveBuf.push({ role: "bot", content: r.reply, mode, at: new Date().toISOString() });
+        if (attachedImage) clearImage();   // one-shot per question
         const h2 = [...history, { role: "user", content: t }, { role: "assistant", content: r.reply }];
         while (h2.length > 12) h2.splice(0, 2);
         setHistory(h2); saveJSON(HISTORY_KEY, h2);
@@ -1240,6 +1278,141 @@ function MainApp() {
     a.click();
     URL.revokeObjectURL(a.href);
   };
+
+  // Rewrite selection (Write tab)
+  const [rewriteTone, setRewriteTone] = useState("clearer and more concise");
+  const rewriteSelection = async () => {
+    const ta = docRef.current;
+    if (!ta) return;
+    const start = ta.selectionStart, end = ta.selectionEnd;
+    if (start === end) { setWriteStatus("✋ Select some text first."); return; }
+    const sel = doc.slice(start, end);
+    const before = doc.slice(0, start);
+    const after = doc.slice(end);
+    setWriteBusy(true);
+    setWriteStatus("Rewriting…");
+    writeAbortRef.current.stop = false;
+    try {
+      const r = await api("/write/rewrite", { method: "POST", body: {
+        selection: sel,
+        tone: rewriteTone,
+        instruction: writeInstruction || null,
+        doc_before: before,
+        doc_after: after,
+        max_chars: 2000,
+      }});
+      // Ghost-type the rewrite over the existing selection
+      setWriteStatus("Typing rewrite…");
+      const newText = r.text || "";
+      // First remove the old selection
+      setDoc(before + after);
+      let i = 0;
+      while (i < newText.length) {
+        if (writeAbortRef.current.stop) break;
+        const slice = newText.slice(0, i + 1);
+        setDoc(before + slice + after);
+        requestAnimationFrame(() => {
+          if (docRef.current) {
+            const cursor = before.length + slice.length;
+            docRef.current.setSelectionRange(cursor, cursor);
+          }
+        });
+        const ch = newText[i];
+        let delay = writeSpeed;
+        if (ch === " ") delay = writeSpeed * 0.6;
+        else if (",.;:!?".includes(ch)) delay = writeSpeed * 6;
+        else if (Math.random() < 0.05) delay = writeSpeed * 3;
+        // eslint-disable-next-line no-loop-func
+        await new Promise(res => setTimeout(res, delay));
+        i++;
+      }
+      setWriteStatus(writeAbortRef.current.stop
+        ? `Stopped after ${i} chars.`
+        : `✓ Rewrote ${sel.length} → ${newText.length} characters.`);
+    } catch (e) {
+      setWriteStatus("❌ " + (e.message || "Failed"));
+    }
+    setWriteBusy(false);
+  };
+
+  // Voice input — Web Speech API
+  const startVoice = (target) => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { alert("Your browser doesn't support speech recognition. Try Chrome."); return; }
+    if (recognitionRef.current) {
+      try { recognitionRef.current.stop(); } catch (_) {} // eslint-disable-line no-unused-vars
+    }
+    const rec = new SR();
+    rec.continuous = false;
+    rec.interimResults = true;
+    rec.lang = navigator.language || "en-US";
+    voiceTargetRef.current = target;
+    rec.onresult = (evt) => {
+      let transcript = "";
+      for (let i = 0; i < evt.results.length; i++) transcript += evt.results[i][0].transcript;
+      if (voiceTargetRef.current === "chat") {
+        setText(t => (t ? t + " " : "") + transcript.replace(/^ +/, ""));
+      } else if (voiceTargetRef.current === "write") {
+        setWriteInstruction(t => (t ? t + " " : "") + transcript.replace(/^ +/, ""));
+      }
+    };
+    rec.onend = () => { setListening(false); recognitionRef.current = null; };
+    rec.onerror = (e) => { setListening(false); console.warn("speech rec err", e); };
+    recognitionRef.current = rec;
+    setListening(true);
+    rec.start();
+  };
+  const stopVoice = () => {
+    try { recognitionRef.current?.stop(); } catch (_) {} // eslint-disable-line no-unused-vars
+    setListening(false);
+  };
+
+  // Image attach (vision)
+  const attachImage = (file) => {
+    if (!file) return;
+    if (!file.type.startsWith("image/")) { alert("Pick an image file."); return; }
+    if (file.size > 4 * 1024 * 1024) { alert("Image too big (4 MB max)."); return; }
+    const fr = new FileReader();
+    fr.onload = () => {
+      setAttachedImage(fr.result);
+      setAttachedImageMeta({ name: file.name, size: file.size });
+    };
+    fr.readAsDataURL(file);
+  };
+  const clearImage = () => { setAttachedImage(null); setAttachedImageMeta(null); };
+
+  // Export chat as Markdown
+  const exportChatMarkdown = () => {
+    const raw = JSON.parse(localStorage.getItem(ARCHIVE_KEY) || "[]");
+    if (!raw.length) { alert("No chat history to export yet."); return; }
+    const lines = [`# Midget jr. chat export`, ``, `_Exported ${new Date().toLocaleString()}_`, ``];
+    for (const m of raw) {
+      const t = m.at ? new Date(m.at).toLocaleString() : "";
+      if (m.role === "user") {
+        lines.push(`### 🧑 ${m.username || "User"} · ${t}`);
+        lines.push("");
+        lines.push("> " + (m.content || "").replace(/\n/g, "\n> "));
+        lines.push("");
+      } else {
+        lines.push(`### 🧠 Midget jr. · ${m.mode || "chat"} · ${t}`);
+        lines.push("");
+        lines.push(m.content || "");
+        if (m.code) {
+          lines.push("```" + (m.lang || ""));
+          lines.push(m.code);
+          lines.push("```");
+        }
+        lines.push("");
+      }
+    }
+    const md = lines.join("\n");
+    const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `midget-chat-${new Date().toISOString().slice(0,10)}.md`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
   useEffect(() => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     if (mode === "visitors" && unlocked) loadVisitors();
@@ -1462,10 +1635,29 @@ function MainApp() {
                 title="Typing speed (ms per character — lower is faster)"
                 data-testid="write-speed"
                 style={{ flex: 1, maxWidth: 110 }}/>
+              <button
+                className={"input-icon-btn" + (listening ? " is-listening" : "")}
+                onClick={()=> listening ? stopVoice() : startVoice("write")}
+                title={listening ? "Stop listening" : "Dictate instruction"}
+                data-testid="write-voice-btn">
+                {listening ? "🔴" : "🎤"}
+              </button>
               {writeBusy
                 ? <button className="qbtn" onClick={stopGhostType} data-testid="write-stop-btn"
                     style={{ background: "var(--orange)" }}>⏹ Stop</button>
                 : <button className="qbtn" onClick={runGhostType} data-testid="write-type-btn">▶ Type here</button>}
+            </div>
+            <div className="row-flex" style={{ marginTop: 8, gap: 8 }}>
+              <input className="qinput" value={rewriteTone}
+                onChange={(e)=>setRewriteTone(e.target.value)}
+                placeholder="Rewrite tone (e.g. punchier, formal, simpler)"
+                data-testid="rewrite-tone"
+                style={{ flex: 2 }}/>
+              <button className="qbtn" onClick={rewriteSelection} disabled={writeBusy} data-testid="rewrite-btn"
+                title="Highlight text in the document below, then click to rewrite it in this tone"
+                style={{ background: "var(--purple)" }}>
+                ✨ Rewrite selection
+              </button>
             </div>
             {writeStatus && (
               <div className="hint" style={{ marginTop: 8, color: writeStatus.startsWith("❌") ? "var(--pink)" : "var(--green)" }}>
@@ -1838,6 +2030,15 @@ function MainApp() {
 
       {inputBarVisible && (
         <div id="input-bar">
+          {attachedImage && mode === "chat" && (
+            <div className="img-preview" data-testid="img-preview">
+              <img src={attachedImage} alt="attached"/>
+              <div className="img-preview-info">
+                <span>📎 {attachedImageMeta?.name || "image"}</span>
+                <button className="img-preview-x" onClick={clearImage} data-testid="img-preview-remove">✕</button>
+              </div>
+            </div>
+          )}
           <div id="input-wrap" style={{ borderColor: accent + "44", boxShadow: `0 0 18px ${accent}11` }}>
             <textarea ref={taRef} id="chat-input" rows={1} value={text}
               onChange={(e)=>{
@@ -1845,13 +2046,34 @@ function MainApp() {
                 e.target.style.height = "auto";
                 e.target.style.height = Math.min(e.target.scrollHeight, 110) + "px";
               }}
+              onPaste={(e)=>{
+                if (mode !== "chat") return;
+                const item = [...(e.clipboardData?.items || [])].find(i => i.type.startsWith("image/"));
+                if (item) { e.preventDefault(); attachImage(item.getAsFile()); }
+              }}
               onKeyDown={(e)=>{ if(e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
               placeholder={username ? MODE_PLACEHOLDERS[mode] : "Set a name first 👆"}
               data-testid="chat-input"/>
-            <button id="send-btn" onClick={send} disabled={typing || !text.trim()} data-testid="send-btn">↑</button>
+            {mode === "chat" && (
+              <>
+                <label className="input-icon-btn" title="Attach an image (vision)" data-testid="attach-img-btn">
+                  📎
+                  <input type="file" accept="image/*" style={{ display: "none" }}
+                    onChange={(e)=>{ attachImage(e.target.files?.[0]); e.target.value = ""; }}/>
+                </label>
+              </>
+            )}
+            <button
+              className={"input-icon-btn" + (listening ? " is-listening" : "")}
+              onClick={()=> listening ? stopVoice() : startVoice("chat")}
+              title={listening ? "Stop listening" : "Speak"}
+              data-testid="voice-btn">
+              {listening ? "🔴" : "🎤"}
+            </button>
+            <button id="send-btn" onClick={send} disabled={typing || (!text.trim() && !attachedImage)} data-testid="send-btn">↑</button>
           </div>
           <div id="input-hint">
-            {username ? <>Asking as <b>{username}</b> · Enter to send · Shift+Enter for new line</>
+            {username ? <>Asking as <b>{username}</b> · Enter to send · Shift+Enter for new line {mode === "chat" && "· Paste/drop images · 🎤 to speak"}</>
                       : <>👆 Click "Set name" to start chatting</>}
           </div>
         </div>

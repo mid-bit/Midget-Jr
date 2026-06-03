@@ -47,6 +47,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
 GROQ_BASE = "https://api.groq.com/openai/v1"
@@ -100,6 +101,7 @@ class ChatBody(BaseModel):
     session_id: Optional[str] = None
     username: Optional[str] = None
     citation_style: Optional[str] = "none"   # none | mla | apa | chicago | ieee | numbered
+    image: Optional[str] = None              # data URL of an attached image (vision)
 
 
 class ShareBody(BaseModel):
@@ -166,6 +168,16 @@ class WriteBody(BaseModel):
     doc_after: str = ""
     tone: Optional[str] = None
     max_chars: int = 1200
+
+
+class RewriteBody(BaseModel):
+    """Rewrite a selected slice of a document in a target tone, keeping it in-place."""
+    selection: str
+    tone: str = "clearer"
+    instruction: Optional[str] = None
+    doc_before: str = ""
+    doc_after: str = ""
+    max_chars: int = 2000
 
 
 class GuestAuthBody(BaseModel):
@@ -756,10 +768,27 @@ async def chat(body: ChatBody, _guest: dict = Depends(maybe_guest)):
         text = (m.get("content") or "").strip()
         if role in ("user", "assistant") and text:
             messages.append({"role": role, "content": text[:2000]})
-    messages.append({"role": "user", "content": body.message})
+
+    # Vision: if the user attached an image, send a multimodal content block.
+    has_image = bool(body.image and body.image.startswith("data:image"))
+    if has_image:
+        messages.append({"role": "user", "content": [
+            {"type": "text", "text": body.message or "Describe this image."},
+            {"type": "image_url", "image_url": {"url": body.image}},
+        ]})
+    else:
+        messages.append({"role": "user", "content": body.message})
 
     try:
-        reply = await llm_chat(messages)
+        if has_image:
+            # Force Groq (Gemini's OpenAI shim is finicky with image_url) and use the vision model.
+            cli, _ = llm_client("groq")
+            r = await cli.chat.completions.create(
+                model=GROQ_VISION_MODEL, messages=messages, temperature=0.5
+            )
+            reply = (r.choices[0].message.content or "").strip()
+        else:
+            reply = await llm_chat(messages)
     except HTTPException:
         raise
     except Exception as e:
@@ -770,7 +799,8 @@ async def chat(body: ChatBody, _guest: dict = Depends(maybe_guest)):
 
     return {"reply": reply, "context_used": len(ctx_docs), "direct_mode": direct,
             "exemplars_used": len(exemplar_docs),
-            "citation_style": (body.citation_style or "none").lower()}
+            "citation_style": (body.citation_style or "none").lower(),
+            "vision": has_image}
 
 
 async def _get_direct_mode() -> bool:
@@ -996,6 +1026,52 @@ async def write_into_doc(body: WriteBody, _guest: dict = Depends(maybe_guest)):
         cut = out[:max_chars]
         last_stop = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"))
         out = cut[: last_stop + 1] if last_stop > 80 else cut
+    return {"text": out, "chars": len(out)}
+
+
+@api.post("/write/rewrite")
+async def rewrite_selection(body: RewriteBody, _guest: dict = Depends(maybe_guest)):
+    """Rewrite a selected slice of a document in a target tone, in-place."""
+    sel = (body.selection or "").strip()
+    if len(sel) < 2:
+        raise HTTPException(400, "Selection too short — highlight some text first.")
+    tone = (body.tone or "clearer").strip()[:60]
+    instruction = (body.instruction or "").strip()[:300]
+    before = (body.doc_before or "")[-1000:]
+    after = (body.doc_after or "")[:600]
+    max_chars = max(80, min(int(body.max_chars or 2000), 4000))
+
+    system = (
+        "You are a precise rewriter. You rewrite ONLY the user-selected slice of a "
+        "document, keeping its meaning intact while adjusting tone or following the "
+        "user's instruction. Rules:\n"
+        "1. Reply with ONLY the rewritten text — no preamble, no markdown fences, no "
+        "quotes around it, no 'Here's the rewrite:'.\n"
+        "2. Keep the rewrite at a similar length to the original unless the user "
+        "explicitly asks for shorter/longer.\n"
+        "3. Match the surrounding paragraph's voice (you'll see text before and after).\n"
+        f"4. Target tone: {tone}."
+    )
+    prompt = (
+        f"User instruction: {instruction or '(none — just adjust to the tone above)'}\n"
+        f"Max length: {max_chars} chars.\n\n"
+        "── Text BEFORE the selection ──\n"
+        f"{before or '(nothing)'}\n\n"
+        "── SELECTED TEXT to rewrite ──\n"
+        f"{sel}\n\n"
+        "── Text AFTER the selection ──\n"
+        f"{after or '(nothing)'}\n\n"
+        "Now rewrite the selected text:"
+    )
+    try:
+        out = await llm_oneshot(system, prompt)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"LLM error: {e}") from e
+    out = re.sub(r'^["\'`]+|["\'`]+$', "", out.strip()).strip()
+    if len(out) > max_chars:
+        out = out[:max_chars]
     return {"text": out, "chars": len(out)}
 
 
