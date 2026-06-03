@@ -30,12 +30,14 @@ const MODE_COLORS = {
   chat: "#f38ba8", query: "#89b4fa", research: "#a6e3a1",
   code: "#cba6f7", import: "#fab387", queue: "#f9e2af",
   visitors: "#74c7ec", manage: "#f5c2e7", learning: "#94e2d5",
+  write: "#f5e0dc",
 };
 const MODE_LABELS = {
   chat: "💬 Chat — ask me anything, I'll use my knowledge base + AI",
   query: "🔍 Query — search exact entries in the knowledge base",
   research: "🌐 Research — fetch info from the web (Google) and save it",
   code: "💻 Code — generate code with AI (download any file type)",
+  write: "✍️ Write — let the AI type into your document right at your cursor",
   import: "📂 Import — upload files to grow Midget's brain (admin)",
   manage: "🗂 Manage — list, search, delete knowledge entries (admin)",
   queue: "📋 Queue — topics scheduled for auto-research every 6 hours",
@@ -788,6 +790,22 @@ function MainApp() {
   );
   useEffect(() => { localStorage.setItem(CITATION_KEY, citationStyle); }, [citationStyle]);
 
+  // Ghost-typer state (Write tab)
+  const [doc, setDoc] = useState(() => localStorage.getItem("mj_doc") || "");
+  const [writeInstruction, setWriteInstruction] = useState("");
+  const [writeTone, setWriteTone] = useState("match the surrounding voice");
+  const [writeMaxChars, setWriteMaxChars] = useState(800);
+  const [writeBusy, setWriteBusy] = useState(false);
+  const [writeStatus, setWriteStatus] = useState("");
+  const [writeSpeed, setWriteSpeed] = useState(18); // ms per character
+  const writeAbortRef = useRef({ stop: false });
+  const docRef = useRef(null);
+  useEffect(() => { localStorage.setItem("mj_doc", doc); }, [doc]);
+
+  // Access tab additions
+  const [codeCustom, setCodeCustom] = useState("");
+  const [codeComplexity, setCodeComplexity] = useState("weak");
+
   // Visitors
   const [visitors, setVisitors] = useState([]);
   const [chatLog, setChatLog] = useState([]);
@@ -1070,9 +1088,15 @@ function MainApp() {
   }
   const createCode = async () => {
     try {
-      const body = { label: codeLabel.trim(), expires_in_days: Number(codeDays) || null, max_uses: codeMax ? Number(codeMax) : null };
+      const body = {
+        code: codeCustom.trim() || undefined,
+        label: codeLabel.trim(),
+        expires_in_days: Number(codeDays) || null,
+        max_uses: codeMax ? Number(codeMax) : null,
+        complexity: codeComplexity,
+      };
       await api("/admin/access-codes", { method: "POST", auth: true, body });
-      setCodeLabel(""); setCodeDays(30); setCodeMax("");
+      setCodeLabel(""); setCodeDays(30); setCodeMax(""); setCodeCustom("");
       loadAccess();
     } catch (e) { alert("Failed: " + e.message); }
   };
@@ -1142,6 +1166,79 @@ function MainApp() {
   const lockLearning = () => {
     setLearnToken(""); setLearnUnlocked(false);
     if (mode === "learning") setMode("chat");
+  };
+
+  // ── Ghost-typer ────────────────────────────────────────────────────
+  const stopGhostType = () => { writeAbortRef.current.stop = true; };
+
+  const runGhostType = async () => {
+    if (!writeInstruction.trim()) {
+      setWriteStatus("Tell me what to write first ✍️");
+      return;
+    }
+    setWriteBusy(true);
+    setWriteStatus("Thinking…");
+    writeAbortRef.current.stop = false;
+    const ta = docRef.current;
+    const pos = ta ? ta.selectionStart : doc.length;
+    const before = doc.slice(0, pos);
+    const after = doc.slice(pos);
+    try {
+      const r = await api("/write", { method: "POST", body: {
+        instruction: writeInstruction,
+        doc_before: before,
+        doc_after: after,
+        tone: writeTone,
+        max_chars: Number(writeMaxChars) || 800,
+      }});
+      setWriteStatus("Typing…");
+      const toType = r.text || "";
+      // Type one character at a time at the cursor, keeping `after` text fixed.
+      let i = 0;
+      const baseBefore = before;
+      const baseAfter = after;
+      while (i < toType.length) {
+        if (writeAbortRef.current.stop) break;
+        const slice = toType.slice(0, i + 1);
+        const newDoc = baseBefore + slice + baseAfter;
+        setDoc(newDoc);
+        // Keep caret right after the inserted slice
+        requestAnimationFrame(() => {
+          if (docRef.current) {
+            const cursor = baseBefore.length + slice.length;
+            docRef.current.setSelectionRange(cursor, cursor);
+          }
+        });
+        // Variable typing rhythm — feels more human
+        const ch = toType[i];
+        let delay = writeSpeed;
+        if (ch === " ") delay = writeSpeed * 0.6;
+        else if (",.;:!?".includes(ch)) delay = writeSpeed * 6;
+        else if (Math.random() < 0.05) delay = writeSpeed * 3;   // tiny "think" pause
+        await new Promise(res => setTimeout(res, delay));
+        i++;
+      }
+      setWriteStatus(writeAbortRef.current.stop
+        ? `Stopped after ${i} chars.`
+        : `✓ Inserted ${toType.length} characters.`);
+    } catch (e) {
+      setWriteStatus("❌ " + (e.message || "Failed"));
+    }
+    setWriteBusy(false);
+  };
+
+  const clearDoc = () => {
+    if (!doc) return;
+    if (!window.confirm("Clear the whole document? This can't be undone.")) return;
+    setDoc("");
+  };
+  const downloadDoc = () => {
+    const blob = new Blob([doc], { type: "text/plain;charset=utf-8" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `midget-doc-${new Date().toISOString().slice(0,10)}.txt`;
+    a.click();
+    URL.revokeObjectURL(a.href);
   };
   useEffect(() => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1286,9 +1383,9 @@ function MainApp() {
       )}
 
       <div id="tabs">
-        {["chat","query","research","code"].map(m => (
+        {["chat","query","research","code","write"].map(m => (
           <button key={m} className={"tab" + (mode === m ? ` active-${m}` : "")} onClick={()=>setMode(m)} data-testid={`tab-${m}`}>
-            {{chat:"💬 Chat",query:"🔍 Query",research:"🌐 Research",code:"💻 Code"}[m]}
+            {{chat:"💬 Chat",query:"🔍 Query",research:"🌐 Research",code:"💻 Code",write:"✍️ Write"}[m]}
           </button>
         ))}
         {visibleAdmin.map(m => (
@@ -1318,7 +1415,7 @@ function MainApp() {
 
       <div id="mode-label">{MODE_LABELS[mode]}</div>
 
-      {!["queue","import","manage","visitors","access","bugs","learning"].includes(mode) && (
+      {!["queue","import","manage","visitors","access","bugs","learning","write"].includes(mode) && (
         <div id="messages" data-testid="messages">
           <div className="tab-intro" data-testid={`intro-${mode}`}>
             <span className="tab-intro-pill">{ {chat:"💬",query:"🔍",research:"🌐",code:"💻"}[mode] }</span>
@@ -1330,6 +1427,67 @@ function MainApp() {
           {messages.map((m, i) => <Bubble key={i} msg={m} onShare={onShareBubble} onTeach={onTeachBubble}/>)}
           {typing && <Typing/>}
           <div ref={messagesEnd}/>
+        </div>
+      )}
+
+      {mode === "write" && (
+        <div className="side-panel write-tab" data-testid="write-tab">
+          <div className="tab-intro" data-testid="intro-write">
+            <span className="tab-intro-pill">✍️</span>
+            <span>Open document. Click where you want the AI to type, describe what to write, hit <b>Type here</b>. It writes character-by-character at your cursor — and you can keep editing around it.</span>
+          </div>
+
+          <div className="write-controls">
+            <textarea className="qinput write-instruction"
+              value={writeInstruction}
+              onChange={(e)=>setWriteInstruction(e.target.value)}
+              placeholder="What should I write? e.g. 'a short polite cancellation email' or 'continue this story for a paragraph'"
+              data-testid="write-instruction"
+              rows={2}/>
+            <div className="row-flex" style={{ marginTop: 8, gap: 8 }}>
+              <input className="qinput" value={writeTone}
+                onChange={(e)=>setWriteTone(e.target.value)}
+                placeholder="Tone (e.g. professional, casual, witty)"
+                data-testid="write-tone"
+                style={{ flex: 2 }}/>
+              <input className="qinput" type="number" min={80} max={4000}
+                value={writeMaxChars}
+                onChange={(e)=>setWriteMaxChars(e.target.value)}
+                title="Max characters to insert"
+                data-testid="write-max-chars"
+                style={{ flex: 1, maxWidth: 110 }}/>
+              <input className="qinput" type="number" min={1} max={200}
+                value={writeSpeed}
+                onChange={(e)=>setWriteSpeed(Number(e.target.value) || 18)}
+                title="Typing speed (ms per character — lower is faster)"
+                data-testid="write-speed"
+                style={{ flex: 1, maxWidth: 110 }}/>
+              {writeBusy
+                ? <button className="qbtn" onClick={stopGhostType} data-testid="write-stop-btn"
+                    style={{ background: "var(--orange)" }}>⏹ Stop</button>
+                : <button className="qbtn" onClick={runGhostType} data-testid="write-type-btn">▶ Type here</button>}
+            </div>
+            {writeStatus && (
+              <div className="hint" style={{ marginTop: 8, color: writeStatus.startsWith("❌") ? "var(--pink)" : "var(--green)" }}>
+                {writeStatus}
+              </div>
+            )}
+          </div>
+
+          <textarea ref={docRef}
+            className="ghost-doc"
+            value={doc}
+            onChange={(e)=>setDoc(e.target.value)}
+            placeholder="Your document starts blank. Type or paste anything here. Click where you want the AI to write next, then hit 'Type here' above."
+            data-testid="write-doc"/>
+
+          <div className="row-flex" style={{ marginTop: 8, justifyContent: "flex-end" }}>
+            <span className="hint" style={{ marginRight: "auto" }}>
+              {doc.length.toLocaleString()} chars · ~{Math.max(1, Math.round(doc.split(/\s+/).filter(Boolean).length))} words
+            </span>
+            <button className="copy-btn" onClick={downloadDoc} data-testid="write-download">⬇ Download .txt</button>
+            <button className="qi-del" onClick={clearDoc} data-testid="write-clear">🗑 Clear</button>
+          </div>
         </div>
       )}
 
@@ -1525,12 +1683,34 @@ function MainApp() {
           </div>
           <div className="panel-card">
             <h3>➕ Generate invite code</h3>
-            <div className="row-flex">
+            <div className="row-flex" style={{ alignItems: "stretch" }}>
+              <input className="qinput"
+                placeholder="Custom code (leave blank to auto-generate)"
+                value={codeCustom}
+                onChange={(e)=>setCodeCustom(e.target.value)}
+                data-testid="code-custom-input"
+                style={{ flex: 2, minWidth: 220 }}/>
+              <select className="qselect" value={codeComplexity}
+                onChange={(e)=>setCodeComplexity(e.target.value)}
+                data-testid="code-complexity-select"
+                style={{ maxWidth: 200 }}
+                title="Strong = 12+ chars with upper, lower, digit, symbol">
+                <option value="weak">🔓 Weak (≥ 4 chars)</option>
+                <option value="strong">🔐 Strong (12+, mixed case + digit + symbol)</option>
+              </select>
+            </div>
+            <div className="row-flex" style={{ marginTop: 8 }}>
               <input className="qinput" placeholder="Label (e.g. 'Alex')" value={codeLabel} onChange={(e)=>setCodeLabel(e.target.value)}/>
               <input className="qinput" type="number" placeholder="Expires in days" value={codeDays} onChange={(e)=>setCodeDays(e.target.value)} style={{ maxWidth: 140 }}/>
               <input className="qinput" type="number" placeholder="Max uses (blank = ∞)" value={codeMax} onChange={(e)=>setCodeMax(e.target.value)} style={{ maxWidth: 160 }}/>
               <button className="qbtn" onClick={createCode} data-testid="create-code-btn">Create</button>
             </div>
+            {codeComplexity === "strong" && (
+              <div className="hint" style={{ marginTop: 6 }}>
+                🔐 Strong codes need 12+ characters with a mix of UPPERCASE, lowercase, a digit, and a symbol like <code>!@#$</code>.
+                Examples: <code>Th!s_Is_S@fe2026</code>, <code>Br0wn-F0x_Jumps!</code>. Leave the field blank to auto-generate one.
+              </div>
+            )}
           </div>
           <div>
             {codes.length === 0 ? <div className="empty-state">No codes yet. Create one above 👆</div>
@@ -1544,6 +1724,7 @@ function MainApp() {
                     </div>
                     <div className="qi-meta">
                       <span className="qi-tag" style={{ color: "#a6adc8" }}>uses: {c.uses}{c.max_uses ? "/"+c.max_uses : ""}</span>
+                      {c.complexity === "strong" && <span className="qi-tag" style={{ color: "#94e2d5" }}>🔐 strong</span>}
                       {c.expires_at && <span className="qi-tag" style={{ color: "#a6e3a1" }}>expires {new Date(c.expires_at).toLocaleDateString()}</span>}
                       <span className="qi-tag" style={{ color: "#6c7086" }}>made {new Date(c.created_at).toLocaleDateString()}</span>
                     </div>

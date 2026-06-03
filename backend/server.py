@@ -152,9 +152,20 @@ class AccessModeBody(BaseModel):
 
 
 class CreateCodeBody(BaseModel):
+    code: Optional[str] = None          # admin-supplied custom code; otherwise auto-generated
     label: Optional[str] = None
     expires_in_days: Optional[int] = 30
     max_uses: Optional[int] = None
+    complexity: Optional[str] = "weak"  # "weak" | "strong"
+
+
+class WriteBody(BaseModel):
+    """Ghost-typer: bot writes prose at the user's cursor position inside a document."""
+    instruction: str
+    doc_before: str = ""
+    doc_after: str = ""
+    tone: Optional[str] = None
+    max_chars: int = 1200
 
 
 class GuestAuthBody(BaseModel):
@@ -936,6 +947,58 @@ async def code(body: CodeBody, _guest: dict = Depends(maybe_guest)):
     return {"code": out, "language": body.language}
 
 
+@api.post("/write")
+async def write_into_doc(body: WriteBody, _guest: dict = Depends(maybe_guest)):
+    """Ghost-typer: produces text that should be inserted at the user's cursor
+    position inside an existing document. The frontend types it out char-by-char.
+    Context (text before + after cursor) is given so the bot picks up tone/voice
+    and doesn't repeat what's already written."""
+    instruction = (body.instruction or "").strip()
+    if len(instruction) < 3:
+        raise HTTPException(400, "Tell me what to write (at least a few words).")
+    before = (body.doc_before or "")[-1500:]
+    after = (body.doc_after or "")[:600]
+    tone = (body.tone or "match the surrounding voice").strip()[:60]
+    max_chars = max(80, min(int(body.max_chars or 1200), 4000))
+
+    system = (
+        "You are a ghostwriter that drops text directly into a user's document at "
+        "their cursor position. Rules:\n"
+        "1. Output ONLY the prose to insert — no preamble, no quotes, no markdown "
+        "fences, no 'Here's your text:'. Just the words.\n"
+        "2. Pay attention to the text immediately before the cursor and continue "
+        "from it naturally. Match its tone, formality, and voice.\n"
+        "3. If there's text immediately after the cursor, write something that "
+        "flows into it gracefully.\n"
+        "4. Keep it under the requested length. Stop on a complete sentence.\n"
+        f"5. Target tone: {tone}."
+    )
+    prompt = (
+        f"Instruction: {instruction}\n"
+        f"Max length: {max_chars} characters.\n\n"
+        "── Text BEFORE the cursor (cursor is at the end of this) ──\n"
+        f"{before or '(empty document)'}\n\n"
+        "── Text AFTER the cursor ──\n"
+        f"{after or '(nothing after)'}\n\n"
+        "Now write the text that should appear at the cursor:"
+    )
+    try:
+        out = await llm_oneshot(system, prompt)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"LLM error: {e}") from e
+    # Strip any accidental wrappers
+    out = out.strip()
+    out = re.sub(r'^["\'`]+|["\'`]+$', "", out).strip()
+    if len(out) > max_chars:
+        # Snap at a sentence boundary
+        cut = out[:max_chars]
+        last_stop = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"))
+        out = cut[: last_stop + 1] if last_stop > 80 else cut
+    return {"text": out, "chars": len(out)}
+
+
 # ── Routes: Admin ────────────────────────────────────────────────────────
 @api.get("/knowledge")
 async def list_kb():
@@ -1018,19 +1081,64 @@ async def set_access_mode(body: AccessModeBody):
     return {"require_guest_pass": bool(body.enabled)}
 
 
+def _check_complexity(code: str, level: str) -> tuple[bool, str]:
+    """Return (ok, error_message). Level: 'weak' = anything ≥ 4 chars.
+    'strong' = ≥ 12 chars with upper+lower+digit+symbol."""
+    c = code or ""
+    if len(c) < 4:
+        return False, "Code must be at least 4 characters."
+    if level == "strong":
+        if len(c) < 12:
+            return False, "Strong codes need ≥ 12 characters."
+        if not re.search(r"[a-z]", c):
+            return False, "Strong codes need a lowercase letter."
+        if not re.search(r"[A-Z]", c):
+            return False, "Strong codes need an uppercase letter."
+        if not re.search(r"\d", c):
+            return False, "Strong codes need a digit."
+        if not re.search(r"[^\w\s]", c):
+            return False, "Strong codes need a symbol (e.g. !@#$)."
+    return True, ""
+
+
 @api.post("/admin/access-codes", dependencies=[Depends(require_admin)])
 async def create_access_code(body: CreateCodeBody):
-    code_str = _short_id(10)
-    for _ in range(3):
-        if not await access_codes.find_one({"code": code_str}):
-            break
-        code_str = _short_id(10)
+    level = (body.complexity or "weak").lower()
+    if level not in ("weak", "strong"):
+        raise HTTPException(400, "complexity must be 'weak' or 'strong'.")
+    # Custom code path
+    if body.code:
+        code_str = body.code.strip()
+        ok, msg = _check_complexity(code_str, level)
+        if not ok:
+            raise HTTPException(400, msg)
+        if await access_codes.find_one({"code": code_str}):
+            raise HTTPException(409, "That code already exists — pick a different one.")
+    else:
+        # Auto-generate. For 'strong', generate a 16-char mixed string that always passes.
+        if level == "strong":
+            import secrets
+            import string
+            alphabet = string.ascii_letters + string.digits
+            symbols = "!@#$%^&*-_"
+            while True:
+                code_str = "".join(secrets.choice(alphabet) for _ in range(14)) + secrets.choice(symbols) + secrets.choice(string.digits)
+                ok, _ = _check_complexity(code_str, level)
+                if ok and not await access_codes.find_one({"code": code_str}):
+                    break
+        else:
+            code_str = _short_id(10)
+            for _ in range(3):
+                if not await access_codes.find_one({"code": code_str}):
+                    break
+                code_str = _short_id(10)
     expires_at = None
     if body.expires_in_days and body.expires_in_days > 0:
         expires_at = (datetime.now(timezone.utc) + timedelta(days=int(body.expires_in_days))).isoformat()
     doc = {
         "code": code_str,
         "label": (body.label or "")[:60],
+        "complexity": level,
         "expires_at": expires_at,
         "max_uses": int(body.max_uses) if body.max_uses else None,
         "uses": 0,
