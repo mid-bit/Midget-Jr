@@ -169,6 +169,7 @@ class WriteBody(BaseModel):
     doc_after: str = ""
     tone: Optional[str] = None
     max_chars: int = 1200
+    humanize: bool = False              # ask LLM for human-style prose (contractions, fillers, varied length)
 
 
 class RewriteBody(BaseModel):
@@ -202,6 +203,14 @@ class GithubSetupBody(BaseModel):
 
 class GithubPushBody(BaseModel):
     message: str = "Midget jr. self-edit"
+
+
+class AgentBody(BaseModel):
+    """One conversational turn with the AI Dev agent. The agent can read files,
+    propose+apply edits, and push to GitHub via tool calls."""
+    message: str
+    history: List[dict] = Field(default_factory=list)
+    auto_apply: bool = False    # if True, agent applies edits without separate admin click
 
 
 class GuestAuthBody(BaseModel):
@@ -1027,6 +1036,16 @@ async def write_into_doc(body: WriteBody, _guest: dict = Depends(maybe_guest)):
         "4. Keep it under the requested length. Stop on a complete sentence.\n"
         f"5. Target tone: {tone}."
     )
+    if body.humanize:
+        system += (
+            "\n\n🤖 HUMANIZE MODE: write like a real person, not an AI. "
+            "Use contractions ('it's', 'don't'). Vary sentence length — mix short "
+            "punchy ones with longer winding ones. Slip in the occasional informal "
+            "filler ('honestly,' 'well,' 'sort of'). Avoid corporate-AI phrases like "
+            "'delve into', 'navigate the landscape', 'unleash the power of', "
+            "'in today's fast-paced world'. Don't start with 'In conclusion'. "
+            "Don't bullet-list everything. Sound like a thoughtful friend, not a chatbot."
+        )
     prompt = (
         f"Instruction: {instruction}\n"
         f"Max length: {max_chars} characters.\n\n"
@@ -1865,6 +1884,224 @@ async def github_push(body: GithubPushBody):
     except Exception as e:
         return {"pushed": False, "reason": str(e),
                 "log": "\n\n".join(logs).replace(pat, "***REDACTED***")}
+
+
+# ── AI Dev agent (conversational code editor like E1) ─────────────────
+AGENT_SYSTEM = (
+    "You are 'Midget Dev', a conversational coding agent that helps the admin "
+    "improve this exact app you live in (Midget jr.). You can ONLY communicate by "
+    "emitting a JSON action block per turn. NEVER write plain English outside "
+    "an action block. NEVER echo the tool result back to the user — read it and "
+    "decide the next action.\n\n"
+    "Tools:\n"
+    "1. read_file — read a source file.\n"
+    "   ```action\n   {\"tool\":\"read_file\",\"path\":\"backend/server.py\"}\n   ```\n"
+    "2. list_files — list editable files.\n"
+    "   ```action\n   {\"tool\":\"list_files\"}\n   ```\n"
+    "3. propose_edit — generate a draft replacement for one file.\n"
+    "   ```action\n   {\"tool\":\"propose_edit\",\"path\":\"frontend/src/App.css\","
+    "\"instruction\":\"add .glow class with pink box shadow\"}\n   ```\n"
+    "4. apply_last_edit — write the most recent draft to disk. ONLY use when the "
+    "admin has explicitly approved or auto_apply is on (you'll see this in the user message).\n"
+    "   ```action\n   {\"tool\":\"apply_last_edit\",\"summary\":\"…\"}\n   ```\n"
+    "5. github_push — commit + push the current code.\n"
+    "   ```action\n   {\"tool\":\"github_push\",\"message\":\"Add .glow utility class\"}\n   ```\n"
+    "6. done — END the turn with a short user-facing message.\n"
+    "   ```action\n   {\"tool\":\"done\",\"message\":\"I drafted the change. Click ✅ Apply to write it.\"}\n   ```\n\n"
+    "Workflow:\n"
+    "• Every turn ENDS with a 'done' action. If you proposed an edit and auto_apply "
+    "is OFF, end with 'done' asking the admin to click Apply.\n"
+    "• Keep the 'done' message short and friendly (<300 chars). No code blocks in it.\n"
+    "• If the user asks a question without needing tools, just emit a single done "
+    "action with the answer.\n"
+    "• You MUST NOT emit prose outside an action. If you do, you will be cut off."
+)
+
+_AGENT_DRAFTS: dict[str, dict] = {}   # in-memory: {session_id: {path, new_content, ...}}
+
+
+def _parse_action_block(reply: str) -> Optional[dict]:
+    """Extract the first ```action {...} ``` block from a reply, or fall back to
+    detecting a raw JSON object."""
+    import json as _json
+    m = re.search(r"```action\s*(\{[\s\S]*?\})\s*```", reply)
+    if not m:
+        m = re.search(r"\{[\s\S]*\"tool\"[\s\S]*\}", reply)
+    if not m:
+        return None
+    raw = m.group(1) if m.lastindex else m.group(0)
+    try:
+        return _json.loads(raw)
+    except Exception:
+        return None
+
+
+async def _run_agent_tool(action: dict, session_key: str, auto_apply: bool) -> dict:
+    """Execute one agent tool call. Returns a result dict that's sent back to the LLM."""
+    tool = (action or {}).get("tool")
+    if tool == "list_files":
+        return {"ok": True, "files": [
+            {"path": p, "description": d} for p, d in EDITABLE_PATHS.items()
+        ]}
+    if tool == "read_file":
+        p = (action.get("path") or "").lstrip("/")
+        if p not in EDITABLE_PATHS:
+            return {"ok": False, "error": f"path '{p}' not in allow-list"}
+        content = _read_file(p)
+        # Cap content sent to LLM to keep prompts manageable
+        return {"ok": True, "path": p, "content": content[:60000],
+                "truncated": len(content) > 60000, "size": len(content)}
+    if tool == "propose_edit":
+        p = (action.get("path") or "").lstrip("/")
+        instr = (action.get("instruction") or "").strip()
+        if p not in EDITABLE_PATHS:
+            return {"ok": False, "error": f"path '{p}' not editable"}
+        if len(instr) < 5:
+            return {"ok": False, "error": "instruction too short"}
+        # Reuse the propose_edit logic
+        try:
+            current = _read_file(p)
+            lang = "Python (FastAPI)" if p.endswith(".py") else ("React JSX" if p.endswith(".js") else "CSS")
+            system = (
+                f"You are a {lang} expert editing the source file '{p}' of Midget jr. "
+                "Return the COMPLETE NEW FILE CONTENT — no markdown fences, no diff. "
+                "Preserve all existing functionality except what the instruction asks to change. "
+                "Output a syntactically complete file ready to save as-is."
+            )
+            prompt = f"INSTRUCTION:\n{instr}\n\nCURRENT FILE:\n{current}\n\nNew full file:"
+            new_content = await llm_oneshot(system, prompt)
+            new_content = re.sub(r"^```[a-zA-Z0-9]*\n", "", new_content.strip())
+            new_content = re.sub(r"\n```$", "", new_content)
+            diff = "".join(difflib.unified_diff(
+                current.splitlines(keepends=True),
+                new_content.splitlines(keepends=True),
+                fromfile=f"a/{p}", tofile=f"b/{p}", n=2,
+            ))
+            _AGENT_DRAFTS[session_key] = {
+                "path": p, "new_content": new_content,
+                "old_size": len(current), "new_size": len(new_content),
+                "instruction": instr,
+            }
+            return {"ok": True, "path": p, "old_size": len(current),
+                    "new_size": len(new_content), "diff_preview": diff[:4000]}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+    if tool == "apply_last_edit":
+        if not auto_apply:
+            return {"ok": False, "error": "auto_apply is OFF — ask the admin to click ✅ Apply in the UI."}
+        draft = _AGENT_DRAFTS.get(session_key)
+        if not draft:
+            return {"ok": False, "error": "no proposed edit in this session"}
+        try:
+            current = _read_file(draft["path"])
+            if current == draft["new_content"]:
+                return {"ok": False, "error": "no change vs current file"}
+            await self_edits.insert_one({
+                "id": str(uuid.uuid4()),
+                "path": draft["path"],
+                "old_content": current,
+                "new_content": draft["new_content"],
+                "summary": (action.get("summary") or draft.get("instruction") or "")[:300],
+                "created_at": _now(),
+                "via": "agent",
+            })
+            _write_file(draft["path"], draft["new_content"])
+            _AGENT_DRAFTS.pop(session_key, None)
+            return {"ok": True, "applied": draft["path"]}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+    if tool == "github_push":
+        try:
+            r = await github_push(GithubPushBody(message=action.get("message", "Midget jr. self-edit")))
+            return {"ok": bool(r.get("pushed")), **r}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+    if tool == "done":
+        return {"ok": True, "done": True, "message": action.get("message") or ""}
+    return {"ok": False, "error": f"unknown tool '{tool}'"}
+
+
+@api.post("/admin/agent/chat", dependencies=[Depends(require_admin)])
+async def agent_chat(body: AgentBody, authorization: Optional[str] = Header(None)):
+    """Run a multi-step agent turn. The agent emits tool calls one at a time;
+    we execute them in a loop (capped) and return a transcript of what happened."""
+    session_key = (authorization or "")[:60]  # one draft slot per admin token
+    transcript: list[dict] = []
+    # Build the seed messages
+    messages: list[dict] = [{"role": "system", "content": AGENT_SYSTEM}]
+    for m in (body.history or [])[-20:]:
+        role = m.get("role")
+        text = (m.get("content") or "").strip()
+        if role in ("user", "assistant", "system") and text:
+            messages.append({"role": role, "content": text[:8000]})
+    messages.append({"role": "user", "content": body.message})
+
+    final_message = ""
+    max_steps = 8
+    for step in range(max_steps):
+        try:
+            reply = await llm_chat(messages, temperature=0.2)
+        except HTTPException as e:
+            transcript.append({"type": "error", "error": str(e.detail)})
+            break
+        except Exception as e:
+            transcript.append({"type": "error", "error": str(e)})
+            break
+        action = _parse_action_block(reply)
+        if not action:
+            # Treat plain text as a done message
+            transcript.append({"type": "say", "text": reply.strip()})
+            final_message = reply.strip()
+            break
+        transcript.append({"type": "action", "action": action})
+        messages.append({"role": "assistant", "content": reply})
+        result = await _run_agent_tool(action, session_key, body.auto_apply)
+        transcript.append({"type": "result", "result": result})
+        # Feed result back as a TOOL-ROLE message (clean — no "TOOL RESULT:" prefix
+        # so the LLM doesn't echo it as prose).
+        import json as _json
+        compact = _json.dumps({"tool": action.get("tool"), "result": result})[:4000]
+        messages.append({"role": "user", "content": f"[system: tool output] {compact}\n\nNow emit your next action."})
+        if action.get("tool") == "done" or result.get("done"):
+            final_message = result.get("message") or action.get("message") or ""
+            break
+    else:
+        final_message = "(agent hit step limit — ask again with more detail)"
+
+    return {"transcript": transcript, "reply": final_message,
+            "pending_draft": _AGENT_DRAFTS.get(session_key, None)}
+
+
+@api.post("/admin/agent/apply", dependencies=[Depends(require_admin)])
+async def agent_apply(authorization: Optional[str] = Header(None)):
+    """Apply the agent's most recent pending draft (used when auto_apply is OFF)."""
+    session_key = (authorization or "")[:60]
+    draft = _AGENT_DRAFTS.get(session_key)
+    if not draft:
+        raise HTTPException(404, "No pending draft.")
+    current = _read_file(draft["path"])
+    if current == draft["new_content"]:
+        _AGENT_DRAFTS.pop(session_key, None)
+        return {"applied": False, "reason": "No change."}
+    await self_edits.insert_one({
+        "id": str(uuid.uuid4()),
+        "path": draft["path"],
+        "old_content": current,
+        "new_content": draft["new_content"],
+        "summary": (draft.get("instruction") or "")[:300],
+        "created_at": _now(),
+        "via": "agent",
+    })
+    _write_file(draft["path"], draft["new_content"])
+    _AGENT_DRAFTS.pop(session_key, None)
+    return {"applied": True, "path": draft["path"]}
+
+
+@api.post("/admin/agent/discard", dependencies=[Depends(require_admin)])
+async def agent_discard(authorization: Optional[str] = Header(None)):
+    session_key = (authorization or "")[:60]
+    _AGENT_DRAFTS.pop(session_key, None)
+    return {"discarded": True}
 
 
 # ── Auto-research scheduler ──────────────────────────────────────────────

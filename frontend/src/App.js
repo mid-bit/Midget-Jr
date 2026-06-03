@@ -30,7 +30,7 @@ const MODE_COLORS = {
   chat: "#f38ba8", query: "#89b4fa", research: "#a6e3a1",
   code: "#cba6f7", import: "#fab387", queue: "#f9e2af",
   visitors: "#74c7ec", manage: "#f5c2e7", learning: "#94e2d5",
-  write: "#f5e0dc", self: "#eba0ac",
+  write: "#f5e0dc", self: "#eba0ac", dev: "#cba6f7",
 };
 const MODE_LABELS = {
   chat: "💬 Chat — ask me anything, I'll use my knowledge base + AI",
@@ -64,6 +64,7 @@ const MODE_INTROS = {
   bugs: "Bug reports submitted by visitors via the 🐛 Bug button in the header. Includes screenshots if attached.",
   learning: "Reinforcement-by-judging. Run a pass and an LLM judge rates each past answer on whether it helps humanity and carries no health risk. Approved Q+A pairs become in-context exemplars that future replies imitate.",
   self: "⚠️ Self-edit zone. Pick a file, describe a change in plain English, preview the diff, then apply. Every edit is backed up — you can roll back one click. Push to GitHub once you've added your PAT.",
+  dev: "🤖 Midget Dev. Talk to me like you talk to a real engineer — 'add a /health endpoint', 'change the chat tab color to teal', 'push to github'. I'll read files, draft changes, and apply with your approval (or auto-apply if you enable it).",
 };
 
 const WELCOME_DISMISS_KEY = "mj_welcome_dismissed";
@@ -855,6 +856,19 @@ function MainApp() {
   const [ghCommit, setGhCommit] = useState("Midget jr. self-edit");
   const [ghLog, setGhLog] = useState("");
 
+  // AI Dev (conversational agent) tab
+  const [devHistory, setDevHistory] = useState([]);  // [{role, content, transcript?, pending?}]
+  const [devInput, setDevInput] = useState("");
+  const [devBusy, setDevBusy] = useState(false);
+  const [devAutoApply, setDevAutoApply] = useState(false);
+  const [devPending, setDevPending] = useState(null);
+  const devScrollRef = useRef(null);
+
+  // Humanizer + Google Doc helpers (Write tab)
+  const [humanize, setHumanize] = useState(false);
+  const [googleDocUrl, setGoogleDocUrl] = useState(() => localStorage.getItem("mj_gdoc_url") || "");
+  useEffect(() => { localStorage.setItem("mj_gdoc_url", googleDocUrl); }, [googleDocUrl]);
+
   // Visitors
   const [visitors, setVisitors] = useState([]);
   const [chatLog, setChatLog] = useState([]);
@@ -1245,31 +1259,72 @@ function MainApp() {
         doc_after: after,
         tone: writeTone,
         max_chars: Number(writeMaxChars) || 800,
+        humanize: humanize,
       }});
       setWriteStatus("Typing…");
       const toType = r.text || "";
-      // Type one character at a time at the cursor, keeping `after` text fixed.
-      let i = 0;
+      // Human typing rhythm: occasional typo + backspace + correct, longer pauses on
+      // sentence starts and commas, micro "think" pauses. Only when humanize is on
+      // do we do typos.
+      const NEIGHBOR = {
+        a:"sq", b:"vn", c:"xv", d:"sf", e:"wr", f:"dg", g:"fh", h:"gj", i:"uo",
+        j:"hk", k:"jl", l:"k", m:"n", n:"bm", o:"ip", p:"o", q:"wa", r:"et",
+        s:"ad", t:"ry", u:"yi", v:"cb", w:"qe", x:"zc", y:"tu", z:"x",
+      };
       const baseBefore = before;
       const baseAfter = after;
+      let i = 0;
       while (i < toType.length) {
         if (writeAbortRef.current.stop) break;
+        const ch = toType[i];
+        // Decide: should we mistype this char first?
+        const mistypeChance = humanize ? 0.045 : 0;
+        const willMistype = ch.match(/[a-zA-Z]/) && Math.random() < mistypeChance && NEIGHBOR[ch.toLowerCase()];
+        if (willMistype) {
+          const opts = NEIGHBOR[ch.toLowerCase()];
+          const wrong = opts[Math.floor(Math.random()*opts.length)];
+          const slice = toType.slice(0, i) + (ch === ch.toUpperCase() ? wrong.toUpperCase() : wrong);
+          setDoc(baseBefore + slice + baseAfter);
+          requestAnimationFrame(() => {
+            if (docRef.current) {
+              const cur = baseBefore.length + slice.length;
+              docRef.current.setSelectionRange(cur, cur);
+            }
+          });
+          // eslint-disable-next-line no-loop-func
+          await new Promise(res => setTimeout(res, writeSpeed * (2 + Math.random()*3)));
+          // notice + backspace
+          // eslint-disable-next-line no-loop-func
+          await new Promise(res => setTimeout(res, writeSpeed * 3));
+          const fixed = toType.slice(0, i);
+          setDoc(baseBefore + fixed + baseAfter);
+          requestAnimationFrame(() => {
+            if (docRef.current) {
+              const cur = baseBefore.length + fixed.length;
+              docRef.current.setSelectionRange(cur, cur);
+            }
+          });
+          // eslint-disable-next-line no-loop-func
+          await new Promise(res => setTimeout(res, writeSpeed * 1.5));
+        }
         const slice = toType.slice(0, i + 1);
         const newDoc = baseBefore + slice + baseAfter;
         setDoc(newDoc);
-        // Keep caret right after the inserted slice
         requestAnimationFrame(() => {
           if (docRef.current) {
             const cursor = baseBefore.length + slice.length;
             docRef.current.setSelectionRange(cursor, cursor);
           }
         });
-        // Variable typing rhythm — feels more human
-        const ch = toType[i];
         let delay = writeSpeed;
         if (ch === " ") delay = writeSpeed * 0.6;
-        else if (",.;:!?".includes(ch)) delay = writeSpeed * 6;
-        else if (Math.random() < 0.05) delay = writeSpeed * 3;   // tiny "think" pause
+        else if (",;:".includes(ch)) delay = writeSpeed * 6;
+        else if (".!?".includes(ch)) delay = writeSpeed * 9;
+        else if (humanize && Math.random() < 0.03) delay = writeSpeed * 25;   // think pause
+        else if (Math.random() < 0.05) delay = writeSpeed * 3;
+        // small jitter
+        delay = delay * (0.7 + Math.random() * 0.6);
+        // eslint-disable-next-line no-loop-func
         await new Promise(res => setTimeout(res, delay));
         i++;
       }
@@ -1294,6 +1349,30 @@ function MainApp() {
     a.download = `midget-doc-${new Date().toISOString().slice(0,10)}.txt`;
     a.click();
     URL.revokeObjectURL(a.href);
+  };
+
+  const copyDocAndOpenGoogle = async () => {
+    if (!doc.trim()) { alert("Document is empty."); return; }
+    try {
+      await navigator.clipboard.writeText(doc);
+    } catch {
+      // Fallback for older browsers / non-HTTPS contexts
+      const ta = document.createElement("textarea");
+      ta.value = doc;
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); } catch (_) {} // eslint-disable-line no-unused-vars
+      ta.remove();
+    }
+    setWriteStatus("📋 Copied to clipboard! Paste into your Google Doc with Cmd/Ctrl+V.");
+    if (googleDocUrl) {
+      const url = googleDocUrl.trim();
+      if (/^https?:\/\/(docs|drive)\.google\.com\//.test(url)) {
+        window.open(url, "_blank", "noopener");
+      } else {
+        alert("That doesn't look like a Google Docs URL.");
+      }
+    }
   };
 
   // Rewrite selection (Write tab)
@@ -1524,6 +1603,59 @@ function MainApp() {
     } catch (e) { setSelfStatus("❌ " + e.message); }
     setSelfBusy(false);
   };
+
+  // ── AI Dev (conversational agent) ─────────────────────────────────
+  const sendDev = async () => {
+    const msg = devInput.trim();
+    if (!msg) return;
+    setDevInput("");
+    const userMsg = { role: "user", content: msg, at: new Date().toISOString() };
+    setDevHistory(h => [...h, userMsg]);
+    setDevBusy(true);
+    try {
+      // Build history without the just-added local userMsg (server sees it via `message`)
+      const histForApi = devHistory.map(m => ({ role: m.role, content: m.content }));
+      const r = await api("/admin/agent/chat", { method: "POST", auth: true, body: {
+        message: msg, history: histForApi, auto_apply: devAutoApply,
+      }});
+      setDevHistory(h => [...h, {
+        role: "assistant",
+        content: r.reply || "(no reply)",
+        transcript: r.transcript || [],
+        at: new Date().toISOString(),
+      }]);
+      setDevPending(r.pending_draft || null);
+    } catch (e) {
+      setDevHistory(h => [...h, { role: "assistant", content: "❌ " + e.message, at: new Date().toISOString() }]);
+    }
+    setDevBusy(false);
+    requestAnimationFrame(() => {
+      if (devScrollRef.current) devScrollRef.current.scrollTop = devScrollRef.current.scrollHeight;
+    });
+  };
+  const devApply = async () => {
+    if (!devPending) return;
+    if (!window.confirm(`Apply ${devPending.path} (${devPending.old_size} → ${devPending.new_size} chars)?`)) return;
+    try {
+      const r = await api("/admin/agent/apply", { method: "POST", auth: true });
+      setDevHistory(h => [...h, { role: "assistant",
+        content: r.applied ? `✅ Wrote ${r.path}.` : `ℹ️ ${r.reason || "No change."}`,
+        at: new Date().toISOString() }]);
+      setDevPending(null);
+    } catch (e) { alert(e.message); }
+  };
+  const devDiscard = async () => {
+    try {
+      await api("/admin/agent/discard", { method: "POST", auth: true });
+      setDevPending(null);
+    } catch (e) { console.warn(e); }
+  };
+  const devClearChat = () => {
+    if (!window.confirm("Clear the AI Dev chat?")) return;
+    setDevHistory([]);
+    setDevPending(null);
+    devDiscard();
+  };
   useEffect(() => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     if (mode === "visitors" && unlocked) loadVisitors();
@@ -1598,7 +1730,7 @@ function MainApp() {
   };
 
   const inputBarVisible = ["chat","query","research","code"].includes(mode);
-  const adminTabs = ["import", "manage", "queue", "visitors", "access", "bugs", "self"];
+  const adminTabs = ["import", "manage", "queue", "visitors", "access", "bugs", "self", "dev"];
   const visibleAdmin = unlocked ? adminTabs : [];
   const showLearningTab = learnUnlocked || unlocked;
 
@@ -1674,7 +1806,7 @@ function MainApp() {
         ))}
         {visibleAdmin.map(m => (
           <button key={m} className={"tab admin-tab" + (mode === m ? ` active-${m}` : "")} onClick={()=>setMode(m)} data-testid={`tab-${m}`}>
-            {{import:"📂 Import",manage:"🗂 Manage",queue:"📋 Queue",visitors:"👥 Visitors",access:"🎟 Access",bugs:"🐛 Bugs",self:"🛠 Self"}[m]}
+            {{import:"📂 Import",manage:"🗂 Manage",queue:"📋 Queue",visitors:"👥 Visitors",access:"🎟 Access",bugs:"🐛 Bugs",self:"🛠 Self",dev:"🤖 AI Dev"}[m]}
           </button>
         ))}
         {showLearningTab && (
@@ -1699,7 +1831,7 @@ function MainApp() {
 
       <div id="mode-label">{MODE_LABELS[mode]}</div>
 
-      {!["queue","import","manage","visitors","access","bugs","learning","write","self"].includes(mode) && (
+      {!["queue","import","manage","visitors","access","bugs","learning","write","self","dev"].includes(mode) && (
         <div id="messages" data-testid="messages">
           <div className="tab-intro" data-testid={`intro-${mode}`}>
             <span className="tab-intro-pill">{ {chat:"💬",query:"🔍",research:"🌐",code:"💻"}[mode] }</span>
@@ -1711,6 +1843,100 @@ function MainApp() {
           {messages.map((m, i) => <Bubble key={i} msg={m} onShare={onShareBubble} onTeach={onTeachBubble}/>)}
           {typing && <Typing/>}
           <div ref={messagesEnd}/>
+        </div>
+      )}
+
+      {mode === "dev" && (
+        <div className="side-panel dev-tab" data-testid="dev-tab">
+          <div className="tab-intro" data-testid="intro-dev">
+            <span className="tab-intro-pill" style={{ background: "var(--purple)" }}>🤖</span>
+            <span>{MODE_INTROS.dev}</span>
+          </div>
+
+          <div className="panel-card" style={{ display: "flex", alignItems: "center", gap: 16 }}>
+            <label className="check-row" style={{ marginBottom: 0 }}>
+              <input type="checkbox" checked={devAutoApply}
+                onChange={(e)=>setDevAutoApply(e.target.checked)}
+                data-testid="dev-auto-apply"/>
+              <span>⚡ Auto-apply edits <span className="hint" style={{ display:"inline" }}>— skip the approval click. ⚠️ Don't use for big files.</span></span>
+            </label>
+            <button className="copy-btn" onClick={devClearChat} style={{ marginLeft: "auto" }}
+              data-testid="dev-clear-btn">🧹 Clear chat</button>
+          </div>
+
+          <div className="dev-chat" ref={devScrollRef} data-testid="dev-chat-pane">
+            {devHistory.length === 0 && (
+              <div className="empty-state">
+                <p>💡 Try saying:</p>
+                <ul style={{ textAlign: "left", maxWidth: 460, margin: "8px auto" }}>
+                  <li>"Read backend/server.py and tell me what /api/chat does"</li>
+                  <li>"In App.css, change the .midget-pulse animation to teal instead of pink"</li>
+                  <li>"Add a /api/version endpoint that returns the package version"</li>
+                  <li>"Push the current code to GitHub with message 'tweak chat color'"</li>
+                </ul>
+              </div>
+            )}
+            {devHistory.map((m, i) => (
+              <div key={i} className={"dev-msg " + m.role}>
+                <div className="dev-msg-avatar">{m.role === "user" ? "👤" : "🤖"}</div>
+                <div className="dev-msg-body">
+                  <div className="dev-msg-text">{m.content}</div>
+                  {m.transcript && m.transcript.length > 1 && (
+                    <details className="dev-msg-trace">
+                      <summary>🔧 {m.transcript.filter(t=>t.type==="action").length} tool call(s)</summary>
+                      <ol style={{ margin: "6px 0 0 18px", padding: 0 }}>
+                        {m.transcript.filter(t => t.type === "action" || t.type === "result").map((t, j) => (
+                          <li key={j} style={{ fontSize: 11, marginBottom: 4 }}>
+                            {t.type === "action"
+                              ? <><b>→ {t.action.tool}</b>{t.action.path ? ` · ${t.action.path}` : ""}{t.action.instruction ? ` · "${t.action.instruction.slice(0,80)}"` : ""}</>
+                              : <span style={{ color: t.result?.ok === false ? "var(--pink)" : "var(--green)" }}>
+                                  {t.result?.ok === false ? "✗" : "✓"} {(t.result?.error || (t.result?.applied ? "wrote " + t.result.applied : "")) || "ok"}
+                                </span>}
+                          </li>
+                        ))}
+                      </ol>
+                    </details>
+                  )}
+                </div>
+              </div>
+            ))}
+            {devBusy && (
+              <div className="dev-msg assistant">
+                <div className="dev-msg-avatar">🤖</div>
+                <div className="dev-msg-body">
+                  <div className="typing"><span></span><span></span><span></span></div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {devPending && (
+            <div className="panel-card" style={{ borderColor: "var(--green)" }}>
+              <h3 style={{ color: "var(--green)" }}>📝 Pending draft: {devPending.path}</h3>
+              <div className="hint">{devPending.old_size} → {devPending.new_size} chars. Apply to write it to disk.</div>
+              <div className="row-flex" style={{ marginTop: 8 }}>
+                <button className="qbtn" onClick={devApply}
+                  style={{ background: "var(--green)", color: "var(--panel)" }}
+                  data-testid="dev-apply-btn">✅ Apply</button>
+                <button className="copy-btn" onClick={devDiscard} data-testid="dev-discard-btn">✗ Discard</button>
+              </div>
+            </div>
+          )}
+
+          <div className="dev-input-bar">
+            <textarea
+              value={devInput}
+              onChange={(e)=>setDevInput(e.target.value)}
+              onKeyDown={(e)=>{ if(e.key==="Enter" && !e.shiftKey) { e.preventDefault(); sendDev(); } }}
+              placeholder="Tell Midget Dev what to do…"
+              data-testid="dev-input"
+              rows={2}/>
+            <button className="qbtn" onClick={sendDev} disabled={devBusy || !devInput.trim()}
+              data-testid="dev-send-btn"
+              style={{ background: "var(--purple)" }}>
+              {devBusy ? "…" : "↑ Send"}
+            </button>
+          </div>
         </div>
       )}
 
@@ -1892,6 +2118,14 @@ function MainApp() {
                 ✨ Rewrite selection
               </button>
             </div>
+            <div className="row-flex" style={{ marginTop: 8, alignItems: "center", gap: 12 }}>
+              <label className="check-row" style={{ marginBottom: 0 }}>
+                <input type="checkbox" checked={humanize}
+                  onChange={(e)=>setHumanize(e.target.checked)}
+                  data-testid="humanize-toggle"/>
+                <span>🧑 Humanize <span className="hint" style={{ display:"inline" }}>— casual voice + occasional realistic typos that self-correct</span></span>
+              </label>
+            </div>
             {writeStatus && (
               <div className="hint" style={{ marginTop: 8, color: writeStatus.startsWith("❌") ? "var(--pink)" : "var(--green)" }}>
                 {writeStatus}
@@ -1905,6 +2139,18 @@ function MainApp() {
             onChange={(e)=>setDoc(e.target.value)}
             placeholder="Your document starts blank. Type or paste anything here. Click where you want the AI to write next, then hit 'Type here' above."
             data-testid="write-doc"/>
+
+          <div className="row-flex" style={{ marginTop: 8, gap: 8 }}>
+            <input className="qinput" value={googleDocUrl}
+              onChange={(e)=>setGoogleDocUrl(e.target.value)}
+              placeholder="Paste a Google Doc URL (optional) to copy + open"
+              data-testid="gdoc-url"
+              style={{ flex: 1 }}/>
+            <button className="qbtn" onClick={copyDocAndOpenGoogle} data-testid="gdoc-copy-open"
+              style={{ background: "var(--blue)" }}>
+              📋 Copy {googleDocUrl ? "+ open Doc" : "to clipboard"}
+            </button>
+          </div>
 
           <div className="row-flex" style={{ marginTop: 8, justifyContent: "flex-end" }}>
             <span className="hint" style={{ marginRight: "auto" }}>
