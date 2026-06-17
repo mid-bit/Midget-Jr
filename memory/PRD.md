@@ -72,6 +72,7 @@ User uploaded a single-file HTML app **Midget jr.** (Chat / Query / Research / C
 
 ## What's Waiting On the User
 - 🟡 **Groq API key** — `RESEARCH_LLM_PROVIDER=groq` is set in `.env`; user needs to paste a Groq key at https://console.groq.com/keys to free Gemini quota for chat/query/code only.
+- ✅ **Stealth+ verified 2026-06-17** — end-to-end curl test confirms Cyrillic homoglyphs reach the response: sample "I neеd а сup оf соffеe to gеt started." contains 8 Cyrillic codepoints (0x435/0x430/0x441/0x43e) in 38 chars (~21%). UI toggle wired correctly via `stealth_plus` field. User can now retest against their AI detectors.
 
 ## Known Limitations / Backlog
 - KB search is regex-based (no embeddings) — fine for hundreds of docs (P2).
@@ -81,10 +82,11 @@ User uploaded a single-file HTML app **Midget jr.** (Chat / Query / Research / C
 - Learning judge uses `RESEARCH_LLM_PROVIDER` to save default-tier quota; consider exposing a dedicated `LEARNING_LLM_PROVIDER` env if needed (P3).
 
 ## Next Action Items
-1. **(blocking)** User pastes Groq API key → Research + Learning judge stop hitting Gemini quota.
-2. **(P2)** Component split for App.js (~1700 lines now) into `components/AdminTabs.js`, `components/Modals.js`.
-3. **(P2)** Real-time learning feedback — auto-run the judge in the background after every N chat exchanges.
-4. **(P3)** Embeddings-based KB search instead of regex.
+1. **(user verification)** Retest Stealth+ output against your specific AI detectors (GPTZero, ZeroGPT, Originality.ai). Backend confirmed homoglyphs are flowing — only your detector's response is unknown.
+2. **(blocking)** User pastes Groq API key → Research + Learning judge stop hitting Gemini quota.
+3. **(P1 refactor)** Component split for `App.js` (~2000 lines) into `components/AdminTabs.js`, `components/Modals.js`, `components/WriteTab.js`. Also break `server.py` (2200+ lines) into `routes/`, `services/`. **Needed** for the Self-Edit/AI-Dev tabs to stop timing out on Render free tier.
+4. **(P2)** Real-time learning feedback — auto-run the judge in the background after every N chat exchanges.
+5. **(P3)** Embeddings-based KB search instead of regex.
 
 ## Test Credentials
 - Admin password: `MidgetsRcool` (POST `/api/unlock`)
