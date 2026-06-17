@@ -870,6 +870,7 @@ function MainApp() {
 
   // Humanizer + Google Doc helpers (Write tab)
   const [humanize, setHumanize] = useState(false);
+  const [stealthPlus, setStealthPlus] = useState(false);
   const [googleDocUrl, setGoogleDocUrl] = useState(() => localStorage.getItem("mj_gdoc_url") || "");
   useEffect(() => { localStorage.setItem("mj_gdoc_url", googleDocUrl); }, [googleDocUrl]);
 
@@ -1265,6 +1266,7 @@ function MainApp() {
         tone: writeTone,
         max_chars: Number(writeMaxChars) || 800,
         humanize: humanize,
+        stealth_plus: stealthPlus,
       }});
       setWriteStatus("Typing…");
       const toType = r.text || "";
@@ -1402,6 +1404,7 @@ function MainApp() {
         doc_after: after,
         max_chars: 2000,
         humanize: humanize,
+        stealth_plus: stealthPlus,
       }});
       // Ghost-type the rewrite over the existing selection
       setWriteStatus("Typing rewrite…");
@@ -2131,12 +2134,19 @@ function MainApp() {
                 ✨ Rewrite selection
               </button>
             </div>
-            <div className="row-flex" style={{ marginTop: 8, alignItems: "center", gap: 12 }}>
+            <div className="row-flex" style={{ marginTop: 8, alignItems: "center", gap: 16, flexWrap: "wrap" }}>
               <label className="check-row" style={{ marginBottom: 0 }}>
                 <input type="checkbox" checked={humanize}
                   onChange={(e)=>setHumanize(e.target.checked)}
                   data-testid="humanize-toggle"/>
-                <span>🥷 Undetectable mode <span className="hint" style={{ display:"inline" }}>— two-pass anti-AI-detector rewrite + realistic typos that self-correct. ~2× slower.</span></span>
+                <span>🥷 Undetectable mode <span className="hint" style={{ display:"inline" }}>— 4-pass humanizer (prompt → temp-1.15 rewrite → rule scrubber → backtranslate). ~5× slower.</span></span>
+              </label>
+              <label className="check-row" style={{ marginBottom: 0 }}>
+                <input type="checkbox" checked={stealthPlus}
+                  onChange={(e)=>setStealthPlus(e.target.checked)}
+                  disabled={!humanize}
+                  data-testid="stealth-plus-toggle"/>
+                <span>🥷+ Stealth+ <span className="hint" style={{ display:"inline" }}>— ☢️ nuclear: invisible Unicode + Cyrillic homoglyphs. Visually identical, opaque to most detectors. <b>Side effect:</b> in-app text search and spell-check on the output will misbehave.</span></span>
               </label>
             </div>
             {writeStatus && (

@@ -169,7 +169,8 @@ class WriteBody(BaseModel):
     doc_after: str = ""
     tone: Optional[str] = None
     max_chars: int = 1200
-    humanize: bool = False              # ask LLM for human-style prose (contractions, fillers, varied length)
+    humanize: bool = False              # 3-pass humanizer
+    stealth_plus: bool = False          # 🥷+ nuclear: backtranslation + unicode tricks
 
 
 class RewriteBody(BaseModel):
@@ -181,6 +182,7 @@ class RewriteBody(BaseModel):
     doc_after: str = ""
     max_chars: int = 2000
     humanize: bool = False
+    stealth_plus: bool = False
 
 
 class SelfProposeBody(BaseModel):
@@ -707,6 +709,68 @@ async def llm_oneshot(system: str, prompt: str, provider: Optional[str] = None,
             ),
         ) from e
     return (r.choices[0].message.content or "").strip()
+
+
+async def _backtranslate(text: str) -> str:
+    """Round-trip text through French to scramble LLM token transition patterns.
+    Detectors fingerprint English-LM token probability sequences; backtranslating
+    forces the model to re-tokenize and emit a different English sequence."""
+    if len(text) < 30:
+        return text
+    try:
+        fr = await llm_oneshot(
+            "Translate the following English text to natural conversational "
+            "French. Output ONLY the French translation, nothing else.",
+            text, temperature=0.6)
+        if not fr or len(fr) < 20:
+            return text
+        en = await llm_oneshot(
+            "Translate the following French text back to natural, casual "
+            "English the way a real person would speak. Use contractions, "
+            "vary sentence length, sound informal. Output ONLY the English "
+            "translation, no preamble.",
+            fr, temperature=0.9)
+        return en if en and len(en) > 20 else text
+    except Exception:
+        return text
+
+
+# Cyrillic / Greek letters that are visually identical to Latin letters.
+# AI detectors that tokenize by Latin alphabet treat these as different tokens,
+# which scrambles the token sequence the detector compares against its model.
+HOMOGLYPHS = {
+    "a": "а",   # U+0430 Cyrillic
+    "e": "е",   # U+0435
+    "o": "о",   # U+043E
+    "c": "с",   # U+0441
+    "p": "р",   # U+0440
+    "y": "у",   # U+0443
+    "x": "х",   # U+0445
+}
+
+
+def _stealth_plus_post(text: str) -> str:
+    """🥷+ nuclear: swap ~30% of homoglyph-eligible letters with Cyrillic
+    look-alikes + insert zero-width joiner between ~10% of words. Visually
+    identical to humans, opaque to most LLM-fingerprint detectors.
+    Side effects: breaks dictionary search in some editors. Use with care."""
+    if not text:
+        return text
+    out_chars = []
+    for ch in text:
+        low = ch.lower()
+        if low in HOMOGLYPHS and _random.random() < 0.30:
+            sub = HOMOGLYPHS[low]
+            out_chars.append(sub.upper() if ch.isupper() else sub)
+        else:
+            out_chars.append(ch)
+    s = "".join(out_chars)
+    # Sprinkle zero-width-joiners between some words
+    words = s.split(" ")
+    for i in range(1, len(words)):
+        if _random.random() < 0.10 and len(words[i]) > 1 and len(words[i-1]) > 1:
+            words[i-1] = words[i-1] + "\u200d"
+    return " ".join(words)
 
 
 # ── Citation contract ───────────────────────────────────────────────────
@@ -1413,6 +1477,16 @@ async def write_into_doc(body: WriteBody, _guest: dict = Depends(maybe_guest)):
         # injects fillers, splits a long sentence, drops one Oxford comma.
         out = _humanize_post(out)
 
+        # Fourth pass: backtranslate English → French → English. Destroys the
+        # LLM's native token transition fingerprint that detectors look for.
+        out = await _backtranslate(out)
+        # Re-run the rule scrambler on the backtranslated text
+        out = _humanize_post(out)
+
+    # Final optional layer: 🥷+ Stealth (homoglyph + zero-width joiners).
+    if body.stealth_plus and out:
+        out = _stealth_plus_post(out)
+
     return {"text": out, "chars": len(out)}
 
 
@@ -1482,6 +1556,10 @@ async def rewrite_selection(body: RewriteBody, _guest: dict = Depends(maybe_gues
         except Exception:
             pass
         out = _humanize_post(out)
+        out = await _backtranslate(out)
+        out = _humanize_post(out)
+    if body.stealth_plus and out:
+        out = _stealth_plus_post(out)
     return {"text": out, "chars": len(out)}
 
 
