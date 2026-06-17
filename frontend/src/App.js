@@ -118,16 +118,20 @@ async function api(path, { method = "GET", body, auth = false, learn = false } =
   // We use XMLHttpRequest instead of fetch because the dev preview environment
   // installs a global fetch interceptor that consumes the body stream before
   // our code gets a chance to read it. XHR isn't intercepted the same way.
+  // Long timeout (3 min) — agent + LLM calls can take a while when Render's
+  // free tier is cold.
   const { status, ok, text } = await new Promise((resolve) => {
     const xhr = new XMLHttpRequest();
     xhr.open(methodU, `${API}${path}`, true);
+    xhr.timeout = 180000;
     Object.entries(headers).forEach(([k, v]) => xhr.setRequestHeader(k, v));
     xhr.onload = () => resolve({ status: xhr.status, ok: xhr.status >= 200 && xhr.status < 300, text: xhr.responseText || "" });
     xhr.onerror = () => resolve({ status: 0, ok: false, text: "", networkError: true });
+    xhr.ontimeout = () => resolve({ status: 0, ok: false, text: "", networkError: true, timedOut: true });
     xhr.send(body ? JSON.stringify(body) : null);
   });
   if (status === 0) {
-    throw new Error("Network error — is the backend awake? (Render free tier sleeps after 15min; first request takes ~30s.)");
+    throw new Error("Network error — backend took too long or is sleeping. Try again in 30s; Render free tier wakes on first request.");
   }
   let data = null;
   if (text) { try { data = JSON.parse(text); } catch { /* not JSON */ } }
@@ -889,7 +893,8 @@ function MainApp() {
     if (mode === "visitors" && unlocked) loadVisitors();
     if (mode === "access" && unlocked) loadAccess();
     if (mode === "bugs" && unlocked) loadBugs();
-    if (mode === "self" && unlocked) { loadSelfFiles(); loadSelfHistory(); loadGhStatus(); }
+    if (mode === "self" && unlocked) { wakeBackend(); loadSelfFiles(); loadSelfHistory(); loadGhStatus(); }
+    if (mode === "dev" && unlocked) { wakeBackend(); }
     if (mode === "learning" && (learnUnlocked || unlocked)) loadExemplars();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, unlocked, learnUnlocked]);
@@ -1604,6 +1609,9 @@ function MainApp() {
     setSelfBusy(false);
   };
 
+  // Wake the backend (Render free tier sleeps after 15min). Fire-and-forget.
+  const wakeBackend = () => { api("/").catch(() => {}); };
+
   // ── AI Dev (conversational agent) ─────────────────────────────────
   const sendDev = async () => {
     const msg = devInput.trim();
@@ -1612,13 +1620,16 @@ function MainApp() {
     const userMsg = { role: "user", content: msg, at: new Date().toISOString() };
     setDevHistory(h => [...h, userMsg]);
     setDevBusy(true);
+    const hintTimer = setTimeout(() => {
+      setDevHistory(h => [...h, { role: "assistant", content: "⏳ Still working — agent loops can take 20-60s on Render free tier when first awakening. Hang tight…", at: new Date().toISOString(), ephemeral: true }]);
+    }, 8000);
     try {
-      // Build history without the just-added local userMsg (server sees it via `message`)
       const histForApi = devHistory.map(m => ({ role: m.role, content: m.content }));
       const r = await api("/admin/agent/chat", { method: "POST", auth: true, body: {
         message: msg, history: histForApi, auto_apply: devAutoApply,
       }});
-      setDevHistory(h => [...h, {
+      clearTimeout(hintTimer);
+      setDevHistory(h => [...h.filter(m => !m.ephemeral), {
         role: "assistant",
         content: r.reply || "(no reply)",
         transcript: r.transcript || [],
@@ -1626,7 +1637,8 @@ function MainApp() {
       }]);
       setDevPending(r.pending_draft || null);
     } catch (e) {
-      setDevHistory(h => [...h, { role: "assistant", content: "❌ " + e.message, at: new Date().toISOString() }]);
+      clearTimeout(hintTimer);
+      setDevHistory(h => [...h.filter(m => !m.ephemeral), { role: "assistant", content: "❌ " + e.message, at: new Date().toISOString() }]);
     }
     setDevBusy(false);
     requestAnimationFrame(() => {

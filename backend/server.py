@@ -1888,52 +1888,101 @@ async def github_push(body: GithubPushBody):
 
 # ── AI Dev agent (conversational code editor like E1) ─────────────────
 AGENT_SYSTEM = (
-    "You are 'Midget Dev', a conversational coding agent that helps the admin "
-    "improve this exact app you live in (Midget jr.). You can ONLY communicate by "
-    "emitting a JSON action block per turn. NEVER write plain English outside "
-    "an action block. NEVER echo the tool result back to the user — read it and "
-    "decide the next action.\n\n"
+    "You are 'Midget Dev', a coding agent. Respond ONLY with a single fenced "
+    "JSON action block per turn. Never prose outside an action. After tool "
+    "results, ALWAYS finish with a 'done' action.\n\n"
+    "Editable paths (use these EXACT strings):\n"
+    "• backend/server.py\n"
+    "• frontend/src/App.js\n"
+    "• frontend/src/App.css\n"
+    "• frontend/src/index.css\n"
+    "• frontend/src/index.js\n\n"
     "Tools:\n"
-    "1. read_file — read a source file.\n"
-    "   ```action\n   {\"tool\":\"read_file\",\"path\":\"backend/server.py\"}\n   ```\n"
-    "2. list_files — list editable files.\n"
-    "   ```action\n   {\"tool\":\"list_files\"}\n   ```\n"
-    "3. propose_edit — generate a draft replacement for one file.\n"
-    "   ```action\n   {\"tool\":\"propose_edit\",\"path\":\"frontend/src/App.css\","
-    "\"instruction\":\"add .glow class with pink box shadow\"}\n   ```\n"
-    "4. apply_last_edit — write the most recent draft to disk. ONLY use when the "
-    "admin has explicitly approved or auto_apply is on (you'll see this in the user message).\n"
-    "   ```action\n   {\"tool\":\"apply_last_edit\",\"summary\":\"…\"}\n   ```\n"
-    "5. github_push — commit + push the current code.\n"
-    "   ```action\n   {\"tool\":\"github_push\",\"message\":\"Add .glow utility class\"}\n   ```\n"
-    "6. done — END the turn with a short user-facing message.\n"
-    "   ```action\n   {\"tool\":\"done\",\"message\":\"I drafted the change. Click ✅ Apply to write it.\"}\n   ```\n\n"
-    "Workflow:\n"
-    "• Every turn ENDS with a 'done' action. If you proposed an edit and auto_apply "
-    "is OFF, end with 'done' asking the admin to click Apply.\n"
-    "• Keep the 'done' message short and friendly (<300 chars). No code blocks in it.\n"
-    "• If the user asks a question without needing tools, just emit a single done "
-    "action with the answer.\n"
-    "• You MUST NOT emit prose outside an action. If you do, you will be cut off."
+    "• list_files — list editable files\n"
+    "• read_file {path} — read a file (truncated to 15KB)\n"
+    "• propose_edit {path, instruction} — draft a full replacement file\n"
+    "• apply_last_edit {summary} — write the draft (auto_apply required)\n"
+    "• github_push {message} — commit + push\n"
+    "• done {message} — END the turn with a short (<200 chars) message\n\n"
+    "Strict rules:\n"
+    "1. ALWAYS end turn with `done`. Max 4 steps total.\n"
+    "2. For 'add X' requests: ONE propose_edit, then ONE done telling admin to ✅ Apply.\n"
+    "3. For questions answerable without tools: ONE done with the answer.\n"
+    "4. Never echo a tool result — read it, decide next step.\n"
+    "5. Emit ONLY ONE fenced action block per response. Format:\n"
+    "```action\n{\"tool\":\"done\",\"message\":\"…\"}\n```"
 )
 
 _AGENT_DRAFTS: dict[str, dict] = {}   # in-memory: {session_id: {path, new_content, ...}}
 
 
 def _parse_action_block(reply: str) -> Optional[dict]:
-    """Extract the first ```action {...} ``` block from a reply, or fall back to
-    detecting a raw JSON object."""
+    """Extract the first valid action-JSON from the LLM reply, even when the
+    JSON itself contains '{}' inside string values. Uses brace counting that
+    respects string literals."""
     import json as _json
-    m = re.search(r"```action\s*(\{[\s\S]*?\})\s*```", reply)
-    if not m:
-        m = re.search(r"\{[\s\S]*\"tool\"[\s\S]*\}", reply)
-    if not m:
-        return None
-    raw = m.group(1) if m.lastindex else m.group(0)
-    try:
-        return _json.loads(raw)
-    except Exception:
-        return None
+
+    def find_objects(text: str) -> list[str]:
+        out: list[str] = []
+        n = len(text)
+        i = 0
+        while i < n:
+            if text[i] != "{":
+                i += 1
+                continue
+            depth = 0
+            in_str = False
+            esc = False
+            start = i
+            while i < n:
+                c = text[i]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif c == "\\":
+                        esc = True
+                    elif c == '"':
+                        in_str = False
+                else:
+                    if c == '"':
+                        in_str = True
+                    elif c == "{":
+                        depth += 1
+                    elif c == "}":
+                        depth -= 1
+                        if depth == 0:
+                            out.append(text[start:i + 1])
+                            i += 1
+                            break
+                i += 1
+            else:
+                break
+        return out
+
+    # First try fenced blocks (preferred)
+    fenced = re.findall(r"```(?:action|json)?\s*([\s\S]*?)\s*```", reply)
+    pools = fenced + [reply]
+    for pool in pools:
+        for raw in find_objects(pool):
+            try:
+                obj = _json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(obj, dict) and obj.get("tool"):
+                return obj
+    return None
+
+
+def _normalize_path(p: str) -> str:
+    """Map short paths the LLM might emit (e.g. 'index.css') to the allow-list key."""
+    p = (p or "").lstrip("/")
+    if p in EDITABLE_PATHS:
+        return p
+    # search for any allow-listed path that ends with the given name
+    for key in EDITABLE_PATHS:
+        if key.endswith("/" + p) or key.endswith(p):
+            return key
+    return p
 
 
 async def _run_agent_tool(action: dict, session_key: str, auto_apply: bool) -> dict:
@@ -1944,18 +1993,17 @@ async def _run_agent_tool(action: dict, session_key: str, auto_apply: bool) -> d
             {"path": p, "description": d} for p, d in EDITABLE_PATHS.items()
         ]}
     if tool == "read_file":
-        p = (action.get("path") or "").lstrip("/")
+        p = _normalize_path(action.get("path") or "")
         if p not in EDITABLE_PATHS:
-            return {"ok": False, "error": f"path '{p}' not in allow-list"}
+            return {"ok": False, "error": f"path '{p}' not in allow-list", "allowed": list(EDITABLE_PATHS.keys())}
         content = _read_file(p)
-        # Cap content sent to LLM to keep prompts manageable
-        return {"ok": True, "path": p, "content": content[:60000],
-                "truncated": len(content) > 60000, "size": len(content)}
+        return {"ok": True, "path": p, "content": content[:15000],
+                "truncated": len(content) > 15000, "size": len(content)}
     if tool == "propose_edit":
-        p = (action.get("path") or "").lstrip("/")
+        p = _normalize_path(action.get("path") or "")
         instr = (action.get("instruction") or "").strip()
         if p not in EDITABLE_PATHS:
-            return {"ok": False, "error": f"path '{p}' not editable"}
+            return {"ok": False, "error": f"path '{p}' not editable", "allowed": list(EDITABLE_PATHS.keys())}
         if len(instr) < 5:
             return {"ok": False, "error": "instruction too short"}
         # Reuse the propose_edit logic
@@ -2037,7 +2085,7 @@ async def agent_chat(body: AgentBody, authorization: Optional[str] = Header(None
     messages.append({"role": "user", "content": body.message})
 
     final_message = ""
-    max_steps = 8
+    max_steps = 4
     for step in range(max_steps):
         try:
             reply = await llm_chat(messages, temperature=0.2)
@@ -2066,7 +2114,10 @@ async def agent_chat(body: AgentBody, authorization: Optional[str] = Header(None
             final_message = result.get("message") or action.get("message") or ""
             break
     else:
-        final_message = "(agent hit step limit — ask again with more detail)"
+        if _AGENT_DRAFTS.get(session_key):
+            final_message = "I drafted the change but ran out of steps before wrapping up. The pending draft is below — click ✅ Apply to write it."
+        else:
+            final_message = "Couldn't finish in 4 steps. Try giving me a more specific instruction (which file + what to change)."
 
     return {"transcript": transcript, "reply": final_message,
             "pending_draft": _AGENT_DRAFTS.get(session_key, None)}
