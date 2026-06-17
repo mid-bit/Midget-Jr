@@ -180,6 +180,7 @@ class RewriteBody(BaseModel):
     doc_before: str = ""
     doc_after: str = ""
     max_chars: int = 2000
+    humanize: bool = False
 
 
 class SelfProposeBody(BaseModel):
@@ -1038,13 +1039,34 @@ async def write_into_doc(body: WriteBody, _guest: dict = Depends(maybe_guest)):
     )
     if body.humanize:
         system += (
-            "\n\n🤖 HUMANIZE MODE: write like a real person, not an AI. "
-            "Use contractions ('it's', 'don't'). Vary sentence length — mix short "
-            "punchy ones with longer winding ones. Slip in the occasional informal "
-            "filler ('honestly,' 'well,' 'sort of'). Avoid corporate-AI phrases like "
-            "'delve into', 'navigate the landscape', 'unleash the power of', "
-            "'in today's fast-paced world'. Don't start with 'In conclusion'. "
-            "Don't bullet-list everything. Sound like a thoughtful friend, not a chatbot."
+            "\n\n🧑 HUMANIZE MODE — write so a real person could believe it was them. "
+            "Hard rules:\n"
+            "• BURSTINESS: mix sentence lengths violently. One fragment. Then a "
+            "longer winding sentence that bends back on itself and breathes. Then "
+            "two short ones. Like this. Never three medium sentences in a row.\n"
+            "• PERPLEXITY: pick the second- or third-most-obvious word sometimes. "
+            "Replace 'utilize' with 'use', 'numerous' with 'a lot of', 'individuals' "
+            "with 'people'. Throw in a specific concrete detail (a name, a number, "
+            "a brand, a place) rather than abstract phrasing.\n"
+            "• CONTRACTIONS: always. don't, it's, isn't, we'll, you're, won't.\n"
+            "• HUMAN VOICE: drop in 'honestly', 'sort of', 'kind of', 'I mean', "
+            "'look', 'well', 'okay so', 'the thing is' — sparingly, like seasoning.\n"
+            "• ALLOWED: comma splices, starting a sentence with 'And' or 'But', "
+            "ending one with a preposition, the occasional missing Oxford comma.\n"
+            "• BANNED PHRASES (do not write these): delve, delve into, navigate, "
+            "navigating, landscape, tapestry, intricate, multifaceted, leverage, "
+            "harness, unleash, robust, seamless, holistic, paradigm, paradigm shift, "
+            "ever-evolving, in today's fast-paced world, in the realm of, "
+            "it's important to note, it's worth noting, it's worth mentioning, "
+            "moreover, furthermore, additionally, in conclusion, to sum up, "
+            "in summary, ultimately, dive into, embark on, journey, plethora, "
+            "myriad, vibrant, bustling, captivating, breathtaking, "
+            "a testament to, a beacon of, foster, fostering, cultivate, "
+            "in essence, at its core, the world of, the realm of, when it comes to, "
+            "as we navigate, as we delve, picture this.\n"
+            "• AVOID: stacks of em dashes (one max), three-item lists with 'and', "
+            "starting paragraphs with 'The'.\n"
+            "• AVOID AI rhythm: don't put a comma right after the first 2 words of a sentence."
         )
     prompt = (
         f"Instruction: {instruction}\n"
@@ -1069,6 +1091,48 @@ async def write_into_doc(body: WriteBody, _guest: dict = Depends(maybe_guest)):
         cut = out[:max_chars]
         last_stop = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"))
         out = cut[: last_stop + 1] if last_stop > 80 else cut
+
+    # ── Second-pass humanizer: explicit anti-detector rewrite ─────────
+    if body.humanize and len(out) > 40:
+        rewrite_sys = (
+            "You take AI-sounding text and rewrite it so an AI-detector flags it "
+            "as human (GPTZero, Originality, Copyleaks). Reply with ONLY the "
+            "rewritten text — no preamble, no quotes, no explanation.\n\n"
+            "Techniques you MUST apply:\n"
+            "1. BURSTINESS: shatter sentence-length uniformity. Use a fragment. "
+            "Then a sentence that meanders longer than feels comfortable, with a "
+            "comma or two interrupting the flow. Then two short clipped ones. "
+            "Mix 4-word and 25-word sentences in the same paragraph.\n"
+            "2. PERPLEXITY: replace the most predictable word with the second or "
+            "third choice. 'Use' instead of 'utilize'. 'Help' instead of 'facilitate'. "
+            "'Make' instead of 'establish'. Pick specific concrete nouns over abstract.\n"
+            "3. CONTRACTIONS: every 'do not' → 'don't', 'is not' → 'isn't', etc.\n"
+            "4. PERSONAL VOICE: weave in 'honestly', 'I mean', 'sort of', 'kind of', "
+            "'look', 'well', 'the thing is' once or twice per paragraph — never more.\n"
+            "5. PUNCTUATION QUIRKS: one comma splice is allowed. Start one sentence "
+            "with 'And' or 'But'. Drop one Oxford comma. Max one em dash.\n"
+            "6. KILL AI tells: any of these words/phrases must be replaced — "
+            "delve, navigate, landscape, tapestry, intricate, multifaceted, "
+            "leverage, harness, unleash, robust, seamless, holistic, paradigm, "
+            "ever-evolving, in today's fast-paced world, in the realm of, "
+            "it's important to note, it's worth noting, moreover, furthermore, "
+            "additionally, in conclusion, to sum up, in summary, ultimately, "
+            "dive into, embark on, journey, plethora, myriad, vibrant, bustling, "
+            "captivating, breathtaking, a testament to, foster, cultivate, "
+            "in essence, at its core, when it comes to, picture this.\n"
+            "7. PRESERVE meaning, length (~±15%), and target tone. Don't add new facts.\n"
+            "8. NEVER use the literal words 'humanize', 'human', or 'AI' in the output."
+        )
+        try:
+            out2 = await llm_oneshot(rewrite_sys,
+                f"Target tone: {tone}.\n\nRewrite this so it reads as human:\n\n{out}")
+            out2 = out2.strip()
+            out2 = re.sub(r'^["\'`]+|["\'`]+$', "", out2).strip()
+            if 20 < len(out2) < max_chars * 2:
+                out = out2
+        except Exception:
+            pass  # fall back to first-pass output
+
     return {"text": out, "chars": len(out)}
 
 
@@ -1115,6 +1179,27 @@ async def rewrite_selection(body: RewriteBody, _guest: dict = Depends(maybe_gues
     out = re.sub(r'^["\'`]+|["\'`]+$', "", out.strip()).strip()
     if len(out) > max_chars:
         out = out[:max_chars]
+
+    # Second-pass humanizer for rewrites too
+    if body.humanize and len(out) > 40:
+        rewrite_sys = (
+            "Rewrite the text so AI-detectors classify it as human-written. "
+            "Reply with ONLY the rewritten text. Use bursty sentence length "
+            "(mix fragments + long sentences), pick less-predictable wording, "
+            "use contractions, sprinkle 'honestly'/'sort of'/'I mean' sparingly. "
+            "Remove these AI-tell words: delve, navigate, landscape, tapestry, "
+            "intricate, leverage, harness, robust, seamless, paradigm, "
+            "in today's fast-paced world, moreover, furthermore, additionally, "
+            "in conclusion, ultimately, dive into, plethora, myriad, vibrant, "
+            "bustling, foster, cultivate. Keep meaning and ~same length."
+        )
+        try:
+            out2 = await llm_oneshot(rewrite_sys, f"Tone: {tone}.\n\n{out}")
+            out2 = re.sub(r'^["\'`]+|["\'`]+$', "", out2.strip()).strip()
+            if 20 < len(out2) < max_chars * 2:
+                out = out2
+        except Exception:
+            pass
     return {"text": out, "chars": len(out)}
 
 

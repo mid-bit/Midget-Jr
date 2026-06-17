@@ -1401,6 +1401,7 @@ function MainApp() {
         doc_before: before,
         doc_after: after,
         max_chars: 2000,
+        humanize: humanize,
       }});
       // Ghost-type the rewrite over the existing selection
       setWriteStatus("Typing rewrite…");
@@ -2135,7 +2136,7 @@ function MainApp() {
                 <input type="checkbox" checked={humanize}
                   onChange={(e)=>setHumanize(e.target.checked)}
                   data-testid="humanize-toggle"/>
-                <span>🧑 Humanize <span className="hint" style={{ display:"inline" }}>— casual voice + occasional realistic typos that self-correct</span></span>
+                <span>🥷 Undetectable mode <span className="hint" style={{ display:"inline" }}>— two-pass anti-AI-detector rewrite + realistic typos that self-correct. ~2× slower.</span></span>
               </label>
             </div>
             {writeStatus && (
