@@ -412,7 +412,6 @@ async def llm_chat(messages: List[dict], temperature: float = 0.7,
             model=model, messages=messages, temperature=temperature
         )
     except RateLimitError as e:
-        # Surface a friendly message instead of a generic stack trace
         used_provider = (provider or LLM_PROVIDER).lower()
         alt = "groq" if used_provider == "gemini" else "gemini"
         raise HTTPException(
@@ -427,11 +426,287 @@ async def llm_chat(messages: List[dict], temperature: float = 0.7,
     return (r.choices[0].message.content or "").strip()
 
 
-async def llm_oneshot(system: str, prompt: str, provider: Optional[str] = None) -> str:
-    return await llm_chat([
-        {"role": "system", "content": system},
-        {"role": "user", "content": prompt},
-    ], provider=provider)
+# ── Aggressive rule-based humanizer (post-LLM) ───────────────────────
+import random as _random  # noqa: E402
+
+# High-frequency "AI-favored" verbs/phrases → casual replacements.
+# Each value is a list — we pick randomly so the output isn't deterministic.
+AI_SWAPS: dict[str, list[str]] = {
+    # nouns
+    "individuals": ["people", "folks", "everyone"],
+    "individual":  ["person", "someone"],
+    "personnel":   ["staff", "people"],
+    "utilization": ["use"],
+    "utilization,": ["use,"],
+    # verbs
+    "utilize":     ["use"],
+    "utilizes":    ["uses"],
+    "utilized":    ["used"],
+    "utilizing":   ["using"],
+    "facilitate":  ["help", "make easier"],
+    "facilitates": ["helps"],
+    "facilitating":["helping"],
+    "demonstrate": ["show"],
+    "demonstrates":["shows"],
+    "demonstrated":["showed"],
+    "leverage":    ["use", "lean on"],
+    "leverages":   ["uses"],
+    "leveraging":  ["using"],
+    "harness":     ["use", "tap"],
+    "harnessing":  ["tapping into"],
+    "obtain":      ["get"],
+    "obtained":    ["got"],
+    "acquire":     ["get", "pick up"],
+    "acquired":    ["got", "picked up"],
+    "purchase":    ["buy"],
+    "purchased":   ["bought"],
+    "endeavor":    ["try"],
+    "endeavors":   ["tries"],
+    "commence":    ["start", "kick off"],
+    "commences":   ["starts"],
+    "commenced":   ["started"],
+    "terminate":   ["end", "stop"],
+    "implement":   ["do", "set up"],
+    "implemented": ["did", "set up"],
+    "implementing":["doing", "setting up"],
+    "establish":   ["set up", "make"],
+    "established": ["set up", "made"],
+    "establishes": ["sets up"],
+    "incorporate": ["add", "mix in"],
+    "incorporates":["adds"],
+    "incorporated":["added", "mixed in"],
+    "incorporating":["adding", "fitting in"],
+    "showcase":    ["show off"],
+    "showcased":   ["showed off"],
+    # adjectives
+    "numerous":    ["a lot of", "loads of", "tons of"],
+    "various":     ["different"],
+    "significant": ["big", "real"],
+    "substantial": ["big"],
+    "considerable":["pretty big", "decent"],
+    "crucial":     ["key", "huge", "matters"],
+    "essential":   ["a must", "key"],
+    "imperative":  ["a must", "gotta"],
+    "vital":       ["key", "matters"],
+    "optimal":     ["best"],
+    "remarkable":  ["wild", "pretty cool"],
+    "exceptional": ["really good"],
+    "comprehensive":["full", "all-in-one"],
+    "extensive":   ["a lot of", "long"],
+    "intricate":   ["complex", "tangled"],
+    "multifaceted":["many-sided"],
+    "robust":      ["solid", "tough"],
+    "seamless":    ["smooth"],
+    # adverbs
+    "significantly":["a lot", "way more"],
+    "substantially":["a lot"],
+    "considerably": ["a fair bit"],
+    "subsequently": ["then", "after that"],
+    "consequently": ["so", "as a result"],
+    "additionally": ["also", "plus"],
+    "furthermore":  ["plus", "also"],
+    "moreover":     ["plus", "and"],
+    "however,":     ["but", "though"],
+    "however":      ["but"],
+    "thus":         ["so"],
+    "therefore":    ["so"],
+    "hence":        ["so"],
+    "essentially":  ["basically"],
+    "ultimately":   ["in the end"],
+    # phrases
+    "in addition,":     ["plus,", "also,"],
+    "in addition":      ["also"],
+    "in conclusion,":   ["so,", "anyway,"],
+    "in conclusion":    ["so"],
+    "to sum up,":       ["so,", "bottom line,"],
+    "in summary,":      ["basically,", "so,"],
+    "in order to":      ["to"],
+    "due to the fact that": ["because"],
+    "for the purpose of":   ["to"],
+    "with regard to":   ["about"],
+    "with regards to":  ["about"],
+    "in regards to":    ["about"],
+    "regarding":        ["about"],
+    "concerning":       ["about"],
+    "it is important to note that": ["heads up:"],
+    "it should be noted that":      ["worth flagging:"],
+    "it is worth noting that":      ["worth saying:"],
+    "in today's fast-paced world":  ["these days"],
+    "in the realm of":  ["in"],
+    "in the world of":  ["in"],
+    "when it comes to": ["with"],
+    "a plethora of":    ["a lot of", "tons of"],
+    "a myriad of":      ["loads of"],
+    "myriad":           ["a lot of"],
+    "delve into":       ["look at", "dig into"],
+    "dive into":        ["dig into"],
+    "embark on":        ["start"],
+    "navigate":         ["work through"],
+    "navigating":       ["working through"],
+    "landscape":        ["scene", "world"],
+    "ever-evolving":    ["changing"],
+    "ever-changing":    ["changing"],
+    "paradigm shift":   ["big change"],
+    "paradigm":         ["model"],
+    "holistic":         ["whole"],
+    "synergy":          ["fit", "combo"],
+    "leverage the power of": ["use"],
+    "harness the power of":  ["use"],
+    "unleash the power of":  ["unlock"],
+    "unlock the potential of":["get the most out of"],
+    "elevate":          ["lift"],
+    "elevates":         ["lifts"],
+    "tapestry":         ["mix", "blend"],
+    "foster":           ["build", "grow"],
+    "fostering":        ["building"],
+    "cultivate":        ["grow", "build"],
+    "cultivating":      ["growing"],
+    "garner":           ["get", "pick up"],
+    "vibrant":          ["lively"],
+    "bustling":         ["busy"],
+    "captivating":      ["catchy", "gripping"],
+    "breathtaking":     ["wild", "incredible"],
+    "picture this:":    ["okay so:", "here's the scene:"],
+    "picture this":     ["imagine"],
+    "a testament to":   ["proof of"],
+    "a beacon of":      ["a spot of"],
+    "at its core":      ["really"],
+    "in essence":       ["basically"],
+    # contraction backfills (catch what the LLM missed)
+    "do not": ["don't"],
+    "does not": ["doesn't"],
+    "did not": ["didn't"],
+    "is not": ["isn't"],
+    "are not": ["aren't"],
+    "was not": ["wasn't"],
+    "were not": ["weren't"],
+    "will not": ["won't"],
+    "would not": ["wouldn't"],
+    "could not": ["couldn't"],
+    "should not": ["shouldn't"],
+    "cannot": ["can't"],
+    "I am ": ["I'm "],
+    "you are ": ["you're "],
+    "they are ": ["they're "],
+    "we are ": ["we're "],
+    "it is ": ["it's "],
+    "that is ": ["that's "],
+    "there is ": ["there's "],
+    "I have ": ["I've "],
+    "you have ": ["you've "],
+    "they have ": ["they've "],
+    "we have ": ["we've "],
+    "I will ": ["I'll "],
+    "you will ": ["you'll "],
+    "they will ": ["they'll "],
+    "we will ": ["we'll "],
+    "I would ": ["I'd "],
+    "you would ": ["you'd "],
+}
+
+
+def _humanize_post(text: str) -> str:
+    """Rule-based post-processor: scrambles the LLM's fingerprint by
+    (a) swapping AI-favored words for casual ones,
+    (b) injecting tiny human filler words,
+    (c) splitting one long sentence into fragments,
+    (d) varying punctuation a bit.
+    Pure mechanics — no LLM call."""
+    if not text or len(text) < 20:
+        return text
+    out = text
+
+    # 1) Word/phrase swaps — case-insensitive, preserve original capitalization
+    for needle, options in AI_SWAPS.items():
+        if needle.lower() not in out.lower():
+            continue
+        def repl(m, opts=options):
+            picked = _random.choice(opts)
+            orig = m.group(0)
+            # match capitalization of first character
+            if orig and orig[0].isupper() and picked:
+                picked = picked[0].upper() + picked[1:]
+            return picked
+        pattern = re.compile(re.escape(needle), re.IGNORECASE)
+        out = pattern.sub(repl, out, count=2)  # cap at 2 swaps per phrase
+
+    # 2) Inject 1-2 sparing fillers at sentence breaks (~10% of sentences)
+    fillers = ["honestly,", "I mean,", "look,", "sort of,", "kind of,",
+               "well,", "you know,", "the thing is,", "okay so,"]
+    sentences = re.split(r"(?<=[.!?])\s+", out)
+    injected = 0
+    for i, s in enumerate(sentences):
+        if injected >= 2:
+            break
+        # Skip first sentence (don't open with a filler), and very short ones
+        if i == 0 or len(s) < 30:
+            continue
+        if _random.random() < 0.18 and not re.match(r"^(honestly|i mean|look|sort of|kind of|well|you know|okay so|the thing)", s.lower()):
+            filler = _random.choice(fillers)
+            # capitalize filler if it starts the sentence (it does here)
+            filler_cap = filler[0].upper() + filler[1:]
+            # Insert after the leading word + space if sentence starts with a short opener like "And"/"But"
+            first_word_match = re.match(r"^(And |But |So |Plus |Also )", s)
+            if first_word_match:
+                head = first_word_match.group(0)
+                s = head + filler_cap.lower() + " " + s[len(head):].lstrip()
+            else:
+                s = filler_cap + " " + s[0].lower() + s[1:] if s and s[0].isalpha() else filler_cap + " " + s
+            sentences[i] = s
+            injected += 1
+    out = " ".join(sentences)
+
+    # 3) Split ONE very long sentence (>30 words) into two: pick a conjunction
+    long_sents = [(i, s) for i, s in enumerate(sentences) if len(s.split()) > 30]
+    if long_sents:
+        idx, s = _random.choice(long_sents)
+        m = re.search(r",?\s+(and|but|because|so)\s+", s)
+        if m and m.start() > 40:
+            new = s[:m.start()].rstrip(",") + ". " + m.group(1).capitalize() + s[m.end()-1:]
+            sentences[idx] = new
+            out = " ".join(sentences)
+
+    # 4) Drop ONE Oxford comma (X, Y, and Z → X, Y and Z) at most once
+    out = re.sub(r"(\b\w+,\s+\w+),\s+(and\s+\w+)", r"\1 \2", out, count=1)
+
+    # 5) Lowercase the first letter of ONE sentence that comes after a comma splice
+    #    (mimics a casual writer who forgot to capitalize)
+    # — Skipped: too risky for false positives. Move on.
+
+    # 6) Add ONE em dash interjection somewhere natural (only if there isn't one already)
+    if "—" not in out and "–" not in out:
+        # Find a comma after a 4+ word clause and 50% chance swap it for ' — '
+        m = re.search(r"(\w+\s+\w+\s+\w+\s+\w+),\s+", out)
+        if m and _random.random() < 0.5:
+            out = out[:m.start(0)] + m.group(1) + " — " + out[m.end(0):]
+
+    return out
+
+
+async def llm_oneshot(system: str, prompt: str, provider: Optional[str] = None,
+                      temperature: float = 0.7) -> str:
+    cli, model = llm_client(provider)
+    try:
+        r = await cli.chat.completions.create(
+            model=model, temperature=temperature,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+        )
+    except RateLimitError as e:
+        used_provider = (provider or LLM_PROVIDER).lower()
+        alt = "groq" if used_provider == "gemini" else "gemini"
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"⏳ {used_provider.title()} daily quota reached. "
+                f"Paste a {alt.title()} key into backend/.env "
+                f"({'GROQ_API_KEY' if alt=='groq' else 'GEMINI_API_KEY'}) "
+                "or wait for the daily reset."
+            ),
+        ) from e
+    return (r.choices[0].message.content or "").strip()
 
 
 # ── Citation contract ───────────────────────────────────────────────────
@@ -1125,13 +1400,18 @@ async def write_into_doc(body: WriteBody, _guest: dict = Depends(maybe_guest)):
         )
         try:
             out2 = await llm_oneshot(rewrite_sys,
-                f"Target tone: {tone}.\n\nRewrite this so it reads as human:\n\n{out}")
+                f"Target tone: {tone}.\n\nRewrite this so it reads as human:\n\n{out}",
+                temperature=1.15)   # high temp = less predictable token choices
             out2 = out2.strip()
             out2 = re.sub(r'^["\'`]+|["\'`]+$', "", out2).strip()
             if 20 < len(out2) < max_chars * 2:
                 out = out2
         except Exception:
-            pass  # fall back to first-pass output
+            pass
+
+        # Third pass: pure rule-based scrambler. Strips remaining AI-favored words,
+        # injects fillers, splits a long sentence, drops one Oxford comma.
+        out = _humanize_post(out)
 
     return {"text": out, "chars": len(out)}
 
@@ -1194,12 +1474,14 @@ async def rewrite_selection(body: RewriteBody, _guest: dict = Depends(maybe_gues
             "bustling, foster, cultivate. Keep meaning and ~same length."
         )
         try:
-            out2 = await llm_oneshot(rewrite_sys, f"Tone: {tone}.\n\n{out}")
+            out2 = await llm_oneshot(rewrite_sys, f"Tone: {tone}.\n\n{out}",
+                                     temperature=1.15)
             out2 = re.sub(r'^["\'`]+|["\'`]+$', "", out2.strip()).strip()
             if 20 < len(out2) < max_chars * 2:
                 out = out2
         except Exception:
             pass
+        out = _humanize_post(out)
     return {"text": out, "chars": len(out)}
 
 
