@@ -868,6 +868,14 @@ function MainApp() {
   const [devPending, setDevPending] = useState(null);
   const devScrollRef = useRef(null);
 
+  // 🧠 E1 Clone (beefier agent: grep, glob, view_logs, search_replace, curl_self)
+  const [e1History, setE1History] = useState([]);
+  const [e1Input, setE1Input] = useState("");
+  const [e1Busy, setE1Busy] = useState(false);
+  const [e1AutoApply, setE1AutoApply] = useState(false);
+  const [e1Pending, setE1Pending] = useState(null);
+  const e1ScrollRef = useRef(null);
+
   // Humanizer + Google Doc helpers (Write tab)
   const [humanize, setHumanize] = useState(false);
   const [stealthPlus, setStealthPlus] = useState(false);
@@ -1672,6 +1680,63 @@ function MainApp() {
     setDevPending(null);
     devDiscard();
   };
+
+  // ── 🧠 E1 Clone agent ─────────────────────────────────────────────
+  const sendE1 = async () => {
+    const msg = e1Input.trim();
+    if (!msg) return;
+    setE1Input("");
+    const userMsg = { role: "user", content: msg, at: new Date().toISOString() };
+    setE1History(h => [...h, userMsg]);
+    setE1Busy(true);
+    const hintTimer = setTimeout(() => {
+      setE1History(h => [...h, { role: "assistant", content: "⏳ Planning + grepping + reading… complex requests can take 30-90s on Render free tier (E1 mode runs up to 8 LLM calls).", at: new Date().toISOString(), ephemeral: true }]);
+    }, 10000);
+    try {
+      const histForApi = e1History.map(m => ({ role: m.role, content: m.content }));
+      const r = await api("/admin/agent/chat", { method: "POST", auth: true, body: {
+        message: msg, history: histForApi, auto_apply: e1AutoApply, clone_mode: true,
+      }});
+      clearTimeout(hintTimer);
+      setE1History(h => [...h.filter(m => !m.ephemeral), {
+        role: "assistant",
+        content: r.reply || "(no reply)",
+        transcript: r.transcript || [],
+        at: new Date().toISOString(),
+      }]);
+      setE1Pending(r.pending_draft || null);
+    } catch (e) {
+      clearTimeout(hintTimer);
+      setE1History(h => [...h.filter(m => !m.ephemeral), { role: "assistant", content: "❌ " + e.message, at: new Date().toISOString() }]);
+    }
+    setE1Busy(false);
+    requestAnimationFrame(() => {
+      if (e1ScrollRef.current) e1ScrollRef.current.scrollTop = e1ScrollRef.current.scrollHeight;
+    });
+  };
+  const e1Apply = async () => {
+    if (!e1Pending) return;
+    if (!window.confirm(`Apply ${e1Pending.path} (${e1Pending.old_size} → ${e1Pending.new_size} chars)?`)) return;
+    try {
+      const r = await api("/admin/agent/apply?clone_mode=true", { method: "POST", auth: true });
+      setE1History(h => [...h, { role: "assistant",
+        content: r.applied ? `✅ Wrote ${r.path}.` : `ℹ️ ${r.reason || "No change."}`,
+        at: new Date().toISOString() }]);
+      setE1Pending(null);
+    } catch (e) { alert(e.message); }
+  };
+  const e1Discard = async () => {
+    try {
+      await api("/admin/agent/discard?clone_mode=true", { method: "POST", auth: true });
+      setE1Pending(null);
+    } catch (e) { console.warn(e); }
+  };
+  const e1ClearChat = () => {
+    if (!window.confirm("Clear the E1 chat?")) return;
+    setE1History([]);
+    setE1Pending(null);
+    e1Discard();
+  };
   useEffect(() => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     if (mode === "visitors" && unlocked) loadVisitors();
@@ -1746,7 +1811,7 @@ function MainApp() {
   };
 
   const inputBarVisible = ["chat","query","research","code"].includes(mode);
-  const adminTabs = ["import", "manage", "queue", "visitors", "access", "bugs", "self", "dev"];
+  const adminTabs = ["import", "manage", "queue", "visitors", "access", "bugs", "self", "dev", "e1"];
   const visibleAdmin = unlocked ? adminTabs : [];
   const showLearningTab = learnUnlocked || unlocked;
 
@@ -1822,7 +1887,7 @@ function MainApp() {
         ))}
         {visibleAdmin.map(m => (
           <button key={m} className={"tab admin-tab" + (mode === m ? ` active-${m}` : "")} onClick={()=>setMode(m)} data-testid={`tab-${m}`}>
-            {{import:"📂 Import",manage:"🗂 Manage",queue:"📋 Queue",visitors:"👥 Visitors",access:"🎟 Access",bugs:"🐛 Bugs",self:"🛠 Self",dev:"🤖 AI Dev"}[m]}
+            {{import:"📂 Import",manage:"🗂 Manage",queue:"📋 Queue",visitors:"👥 Visitors",access:"🎟 Access",bugs:"🐛 Bugs",self:"🛠 Self",dev:"🤖 AI Dev",e1:"🧠 E1"}[m]}
           </button>
         ))}
         {showLearningTab && (
@@ -1847,7 +1912,7 @@ function MainApp() {
 
       <div id="mode-label">{MODE_LABELS[mode]}</div>
 
-      {!["queue","import","manage","visitors","access","bugs","learning","write","self","dev"].includes(mode) && (
+      {!["queue","import","manage","visitors","access","bugs","learning","write","self","dev","e1"].includes(mode) && (
         <div id="messages" data-testid="messages">
           <div className="tab-intro" data-testid={`intro-${mode}`}>
             <span className="tab-intro-pill">{ {chat:"💬",query:"🔍",research:"🌐",code:"💻"}[mode] }</span>
@@ -1951,6 +2016,110 @@ function MainApp() {
               data-testid="dev-send-btn"
               style={{ background: "var(--purple)" }}>
               {devBusy ? "…" : "↑ Send"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {mode === "e1" && (
+        <div className="side-panel dev-tab" data-testid="e1-tab">
+          <div className="tab-intro" data-testid="intro-e1">
+            <span className="tab-intro-pill" style={{ background: "linear-gradient(135deg, #cba6f7 0%, #89b4fa 100%)", color: "var(--base)" }}>🧠</span>
+            <span>
+              <b>E1 Clone</b> — the beefier coding agent: plans first, then uses <code>grep</code>,
+              <code> glob_files</code>, <code>read_file</code> (with line ranges so big files don't choke),
+              <code> view_logs</code>, <code>search_replace</code> (surgical edits — way safer than whole-file
+              rewrites), <code>curl_self</code> (smoke-tests your own API), <code>create_file</code>, and
+              <code> github_push</code>. Up to 8 steps per turn. Editable scope: anywhere under <code>/app</code>
+              except <code>.env</code>, <code>.git</code>, <code>node_modules</code>.
+              {" "}<i>This is a best-effort functional clone of the agent that built this app — same workflow, your Groq/Gemini LLM.</i>
+            </span>
+          </div>
+
+          <div className="panel-card" style={{ display: "flex", alignItems: "center", gap: 16 }}>
+            <label className="check-row" style={{ marginBottom: 0 }}>
+              <input type="checkbox" checked={e1AutoApply}
+                onChange={(e)=>setE1AutoApply(e.target.checked)}
+                data-testid="e1-auto-apply"/>
+              <span>⚡ Auto-apply edits <span className="hint" style={{ display:"inline" }}>— skip the approval click. ⚠️ Trust at your own risk.</span></span>
+            </label>
+            <button className="copy-btn" onClick={e1ClearChat} style={{ marginLeft: "auto" }}
+              data-testid="e1-clear-btn">🧹 Clear chat</button>
+          </div>
+
+          <div className="dev-chat" ref={e1ScrollRef} data-testid="e1-chat-pane">
+            {e1History.length === 0 && (
+              <div className="empty-state">
+                <p>💡 Try saying:</p>
+                <ul style={{ textAlign: "left", maxWidth: 540, margin: "8px auto" }}>
+                  <li>"Grep for <code>stealth_plus</code> in the backend and tell me every line it appears on."</li>
+                  <li>"Read lines 200-260 of backend/server.py and explain what they do."</li>
+                  <li>"In App.css, change the <code>--pink</code> variable from #f5c2e7 to #ff6b9d. Use search_replace."</li>
+                  <li>"Add a tiny <code>/api/version</code> GET endpoint that returns {"{ version: '0.1.0' }"}. Search for where the other public endpoints are defined first."</li>
+                  <li>"Check the backend logs for any 500 errors in the last 100 lines."</li>
+                  <li>"Smoke-test <code>/api/</code> with curl_self and confirm the response shape."</li>
+                </ul>
+              </div>
+            )}
+            {e1History.map((m, i) => (
+              <div key={i} className={"dev-msg " + m.role}>
+                <div className="dev-msg-avatar">{m.role === "user" ? "👤" : "🧠"}</div>
+                <div className="dev-msg-body">
+                  <div className="dev-msg-text">{m.content}</div>
+                  {m.transcript && m.transcript.length > 1 && (
+                    <details className="dev-msg-trace">
+                      <summary>🔧 {m.transcript.filter(t=>t.type==="action").length} tool call(s)</summary>
+                      <ol style={{ margin: "6px 0 0 18px", padding: 0 }}>
+                        {m.transcript.filter(t => t.type === "action" || t.type === "result").map((t, j) => (
+                          <li key={j} style={{ fontSize: 11, marginBottom: 4 }}>
+                            {t.type === "action"
+                              ? <><b>→ {t.action.tool}</b>{t.action.path ? ` · ${t.action.path}` : ""}{t.action.pattern ? ` · /${t.action.pattern}/` : ""}{t.action.instruction ? ` · "${t.action.instruction.slice(0,80)}"` : ""}{t.action.steps ? ` · ${t.action.steps.length} step plan` : ""}</>
+                              : <span style={{ color: t.result?.ok === false ? "var(--pink)" : "var(--green)" }}>
+                                  {t.result?.ok === false ? "✗" : "✓"} {t.result?.error || (t.result?.applied ? "wrote " + t.result.applied : "") || (t.result?.count !== undefined ? `${t.result.count} hit(s)` : "") || (t.result?.total_lines ? `${t.result.total_lines} lines total` : "") || (t.result?.status ? `HTTP ${t.result.status}` : "") || "ok"}
+                                </span>}
+                          </li>
+                        ))}
+                      </ol>
+                    </details>
+                  )}
+                </div>
+              </div>
+            ))}
+            {e1Busy && (
+              <div className="dev-msg assistant">
+                <div className="dev-msg-avatar">🧠</div>
+                <div className="dev-msg-body">
+                  <div className="typing"><span></span><span></span><span></span></div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {e1Pending && (
+            <div className="panel-card" style={{ borderColor: "var(--green)" }}>
+              <h3 style={{ color: "var(--green)" }}>📝 Pending draft: {e1Pending.path}</h3>
+              <div className="hint">{e1Pending.old_size} → {e1Pending.new_size} chars. Apply to write it to disk.</div>
+              <div className="row-flex" style={{ marginTop: 8 }}>
+                <button className="qbtn" onClick={e1Apply}
+                  style={{ background: "var(--green)", color: "var(--panel)" }}
+                  data-testid="e1-apply-btn">✅ Apply</button>
+                <button className="copy-btn" onClick={e1Discard} data-testid="e1-discard-btn">✗ Discard</button>
+              </div>
+            </div>
+          )}
+
+          <div className="dev-input-bar">
+            <textarea
+              value={e1Input}
+              onChange={(e)=>setE1Input(e.target.value)}
+              onKeyDown={(e)=>{ if(e.key==="Enter" && !e.shiftKey) { e.preventDefault(); sendE1(); } }}
+              placeholder="Tell E1 what to do — it'll plan, grep, read, edit surgically, and smoke-test…"
+              data-testid="e1-input"
+              rows={2}/>
+            <button className="qbtn" onClick={sendE1} disabled={e1Busy || !e1Input.trim()}
+              data-testid="e1-send-btn"
+              style={{ background: "linear-gradient(135deg, #cba6f7 0%, #89b4fa 100%)", color: "var(--base)" }}>
+              {e1Busy ? "…" : "↑ Send"}
             </button>
           </div>
         </div>

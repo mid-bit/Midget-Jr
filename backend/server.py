@@ -214,6 +214,7 @@ class AgentBody(BaseModel):
     message: str
     history: List[dict] = Field(default_factory=list)
     auto_apply: bool = False    # if True, agent applies edits without separate admin click
+    clone_mode: bool = False    # 🧠 E1 tab: bigger tool surface + 8-step cap + planner-style prompt
 
 
 class GuestAuthBody(BaseModel):
@@ -2332,6 +2333,227 @@ async def github_push(body: GithubPushBody):
 
 
 # ── AI Dev agent (conversational code editor like E1) ─────────────────
+# ── 🧠 E1 Clone mode helpers ───────────────────────────────────────────
+# Clone mode gives the agent a wider surface area: read with line ranges,
+# glob, grep, supervisor logs, surgical search/replace edits, and curl on
+# its own backend. Path access is broader (anywhere under /app except the
+# protected list) but writes are still gated through the draft + apply flow.
+_E1_BLOCKED_PARTS = (".env", ".git/", "node_modules/", "/build/", "/.next/",
+                     "/dist/", "__pycache__/", ".emergent/")
+
+
+def _e1_resolve(rel: str) -> str:
+    """Resolve a relative path to an absolute path under /app, blocking secrets."""
+    rel = (rel or "").strip()
+    if not rel:
+        raise HTTPException(400, "empty path")
+    # Accept both relative ("backend/server.py") and absolute ("/app/backend/server.py")
+    if rel.startswith("/app/"):
+        rel = rel[len("/app/"):]
+    elif rel.startswith("/app"):
+        rel = rel[len("/app"):]
+    rel = rel.lstrip("/")
+    # Normalise — disallow .. traversal entirely
+    if ".." in rel.split("/"):
+        raise HTTPException(403, "path traversal blocked")
+    abs_path = os.path.normpath(os.path.join(APP_ROOT, rel))
+    if not abs_path.startswith(APP_ROOT + os.sep) and abs_path != APP_ROOT:
+        raise HTTPException(403, "path escapes /app")
+    low = abs_path.lower()
+    for blocked in _E1_BLOCKED_PARTS:
+        if blocked in low:
+            raise HTTPException(403, f"protected path segment: {blocked}")
+    return abs_path
+
+
+def _e1_read(rel: str, start: int = 1, end: int = 400) -> dict:
+    """Read a file slice. 1-indexed lines, end-inclusive. Cap end at start+400."""
+    abs_path = _e1_resolve(rel)
+    if not os.path.isfile(abs_path):
+        raise HTTPException(404, f"not a file: {rel}")
+    start = max(1, int(start or 1))
+    end = max(start, int(end or start + 400))
+    end = min(end, start + 400)  # hard cap: 400 lines per read
+    with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+        all_lines = f.readlines()
+    total = len(all_lines)
+    sliced = all_lines[start - 1: end]
+    return {
+        "path": rel, "total_lines": total, "start": start,
+        "end": min(end, total), "content": "".join(sliced),
+        "truncated": end < total,
+    }
+
+
+def _e1_glob(pattern: str, limit: int = 50) -> list[str]:
+    """Recursive glob for files under /app, blocking secrets + node_modules.
+    Accepts both relative ("frontend/src/**/*.js") and absolute ("/app/...") patterns."""
+    import glob as _glob
+    pattern = (pattern or "").strip()
+    if pattern.startswith("/app/"):
+        pattern = pattern[len("/app/"):]
+    elif pattern.startswith("/app"):
+        pattern = pattern[len("/app"):]
+    pattern = pattern.lstrip("/")
+    full = os.path.join(APP_ROOT, pattern)
+    matches: list[str] = []
+    for m in _glob.glob(full, recursive=True):
+        low = m.lower()
+        if any(b in low for b in _E1_BLOCKED_PARTS):
+            continue
+        if os.path.isfile(m):
+            matches.append(os.path.relpath(m, APP_ROOT))
+            if len(matches) >= limit:
+                break
+    return matches
+
+
+def _e1_grep(pattern: str, path: str = "", limit: int = 40) -> list[dict]:
+    """Plain-text or regex search across files. `path` may be a glob or dir."""
+    import re as _re
+    if not pattern:
+        return []
+    try:
+        rx = _re.compile(pattern)
+    except _re.error:
+        rx = _re.compile(_re.escape(pattern))
+    targets: list[str] = []
+    if path:
+        path = path.strip()
+        if path.startswith("/app/"):
+            path = path[len("/app/"):]
+        elif path.startswith("/app"):
+            path = path[len("/app"):]
+        path = path.lstrip("/")
+        if "*" in path or "?" in path:
+            targets = _e1_glob(path, limit=200)
+        else:
+            abs_target = _e1_resolve(path)
+            if os.path.isdir(abs_target):
+                for root, dirs, files in os.walk(abs_target):
+                    dirs[:] = [d for d in dirs if not any(b.strip("/") == d for b in _E1_BLOCKED_PARTS)]
+                    for fn in files:
+                        targets.append(os.path.relpath(os.path.join(root, fn), APP_ROOT))
+            else:
+                targets = [path]
+    else:
+        # default: backend/server.py + frontend/src/* (the common edit targets)
+        targets = _e1_glob("backend/*.py", 50) + _e1_glob("frontend/src/**/*.js", 50) + \
+                  _e1_glob("frontend/src/**/*.css", 50)
+    hits: list[dict] = []
+    for rel in targets:
+        try:
+            abs_p = _e1_resolve(rel)
+        except HTTPException:
+            continue
+        if not os.path.isfile(abs_p):
+            continue
+        try:
+            with open(abs_p, "r", encoding="utf-8", errors="replace") as f:
+                for lineno, line in enumerate(f, 1):
+                    if rx.search(line):
+                        hits.append({"path": rel, "line": lineno, "text": line.rstrip("\n")[:240]})
+                        if len(hits) >= limit:
+                            return hits
+        except Exception:
+            continue
+    return hits
+
+
+def _e1_tail_log(service: str, lines: int = 80) -> str:
+    """Tail the last N lines of a supervisor log (backend or frontend)."""
+    service = (service or "backend").lower().strip()
+    if service not in ("backend", "frontend", "mongodb"):
+        return f"unknown service '{service}'; allowed: backend, frontend, mongodb"
+    lines = max(10, min(int(lines or 80), 300))
+    candidates = [
+        f"/var/log/supervisor/{service}.err.log",
+        f"/var/log/supervisor/{service}.out.log",
+    ]
+    out: list[str] = []
+    for p in candidates:
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8", errors="replace") as f:
+                    tail = f.readlines()[-lines:]
+                out.append(f"── {os.path.basename(p)} (last {len(tail)} lines) ──\n" + "".join(tail))
+            except Exception as e:
+                out.append(f"── {p}: read failed: {e} ──")
+    return "\n\n".join(out) or f"no logs found for {service}"
+
+
+async def _e1_curl_self(path: str, method: str = "GET", json_body: Optional[dict] = None,
+                        token_for_auth: str = "") -> dict:
+    """Call our own backend (admin smoke test). path must start with /api/."""
+    path = (path or "").strip()
+    if not path.startswith("/api/"):
+        return {"ok": False, "error": "path must start with /api/"}
+    method = (method or "GET").upper()
+    if method not in ("GET", "POST", "DELETE"):
+        return {"ok": False, "error": "method must be GET/POST/DELETE"}
+    url = f"http://127.0.0.1:8001{path}"
+    headers = {}
+    if token_for_auth:
+        headers["Authorization"] = f"Bearer {token_for_auth}"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as cx:
+            r = await cx.request(method, url, json=json_body, headers=headers)
+        body = r.text[:2000]
+        return {"ok": r.status_code < 400, "status": r.status_code, "body": body}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:300]}
+
+
+# Surgical edit: like our `search_replace` tool. old_str must match exactly &
+# uniquely. Stages the result in the same draft slot as `propose_edit`.
+def _e1_stage_search_replace(rel: str, old_str: str, new_str: str,
+                             session_key: str, replace_all: bool = False) -> dict:
+    abs_path = _e1_resolve(rel)
+    if not os.path.isfile(abs_path):
+        return {"ok": False, "error": f"not a file: {rel}"}
+    with open(abs_path, "r", encoding="utf-8") as f:
+        current = f.read()
+    if old_str not in current:
+        return {"ok": False, "error": "old_str not found verbatim in file"}
+    if not replace_all and current.count(old_str) > 1:
+        return {"ok": False, "error": f"old_str occurs {current.count(old_str)} times — pass replace_all:true or add more context"}
+    new_content = current.replace(old_str, new_str) if replace_all else current.replace(old_str, new_str, 1)
+    if new_content == current:
+        return {"ok": False, "error": "no change"}
+    diff = "".join(difflib.unified_diff(
+        current.splitlines(keepends=True),
+        new_content.splitlines(keepends=True),
+        fromfile=f"a/{rel}", tofile=f"b/{rel}", n=2,
+    ))
+    _AGENT_DRAFTS[session_key] = {
+        "path": rel, "new_content": new_content,
+        "old_size": len(current), "new_size": len(new_content),
+        "instruction": f"search_replace ({len(old_str)} → {len(new_str)} chars)",
+        "kind": "search_replace",
+    }
+    return {"ok": True, "path": rel, "old_size": len(current),
+            "new_size": len(new_content), "diff_preview": diff[:4000]}
+
+
+def _e1_stage_create_file(rel: str, content: str, session_key: str) -> dict:
+    abs_path = _e1_resolve(rel)
+    if os.path.exists(abs_path):
+        return {"ok": False, "error": "file already exists — use search_replace or propose_edit"}
+    diff_preview = f"+++ b/{rel} (new file, {len(content)} chars)\n" + "\n".join(
+        "+ " + ln for ln in content.splitlines()[:60]
+    )
+    if len(content.splitlines()) > 60:
+        diff_preview += f"\n+ ... ({len(content.splitlines()) - 60} more lines)"
+    _AGENT_DRAFTS[session_key] = {
+        "path": rel, "new_content": content,
+        "old_size": 0, "new_size": len(content),
+        "instruction": f"create_file ({len(content)} chars)",
+        "kind": "create_file",
+    }
+    return {"ok": True, "path": rel, "new_size": len(content), "diff_preview": diff_preview}
+
+
+# ── AI Dev agent (legacy lite mode) ───────────────────────────────────
 AGENT_SYSTEM = (
     "You are 'Midget Dev', a coding agent. Respond ONLY with a single fenced "
     "JSON action block per turn. Never prose outside an action. After tool "
@@ -2356,6 +2578,59 @@ AGENT_SYSTEM = (
     "4. Never echo a tool result — read it, decide next step.\n"
     "5. Emit ONLY ONE fenced action block per response. Format:\n"
     "```action\n{\"tool\":\"done\",\"message\":\"…\"}\n```"
+)
+
+
+# ── 🧠 E1 Clone agent system prompt ───────────────────────────────────
+E1_AGENT_SYSTEM = (
+    "You are 'E1 Clone' — a senior full-stack coding agent embedded INSIDE the "
+    "Midget jr. app you are editing. You behave like the agent that originally "
+    "built this codebase: plan first, read before editing, prefer surgical "
+    "search/replace over whole-file rewrites, smoke-test after a change, and "
+    "speak conversationally to the admin when you are done.\n\n"
+    "OUTPUT FORMAT — STRICT:\n"
+    "Every turn you emit EXACTLY ONE fenced action block, no prose around it:\n"
+    "```action\n{\"tool\":\"<name>\", ...args}\n```\n"
+    "After we run the tool we feed you its result; then you emit the NEXT "
+    "action. The conversation always ends with a `done` action.\n\n"
+    "TOOLS (full surface area):\n"
+    "• plan {steps:[\"…\",\"…\"]} — write a short plan BEFORE you start work. "
+    "Free, always allowed, use it for any task >1 step.\n"
+    "• list_files — list the legacy short allow-list (still works).\n"
+    "• glob_files {pattern} — recursive glob under /app (e.g. \"frontend/src/**/*.js\").\n"
+    "• grep {pattern, path?} — search code. `path` may be a glob, dir, or single file.\n"
+    "• read_file {path, start?, end?} — read 1-indexed line range. Max 400 lines per call. "
+    "If you don't pass start/end you get lines 1-400. For larger files PAGE through with start.\n"
+    "• view_logs {service, lines?} — tail supervisor logs. service: backend|frontend|mongodb.\n"
+    "• search_replace {path, old_str, new_str, replace_all?} — surgical edit. old_str must match "
+    "EXACTLY and be unique unless replace_all:true. PREFERRED over propose_edit for small changes.\n"
+    "• create_file {path, content} — create a NEW file (errors if it exists).\n"
+    "• propose_edit {path, instruction} — whole-file rewrite via sub-LLM. Use ONLY when "
+    "the change spans many places. Slow + token-heavy.\n"
+    "• apply_last_edit {summary} — write the pending draft. Requires auto_apply OR the admin "
+    "clicks ✅ Apply in the UI.\n"
+    "• curl_self {path, method?, json?} — smoke test our own backend. path must start with /api/.\n"
+    "• github_push {message} — commit + push to the configured GitHub repo.\n"
+    "• done {message} — end the turn with a 1-3 sentence summary for the admin (markdown ok).\n\n"
+    "WORKFLOW EXPECTATIONS:\n"
+    "1. For anything ambiguous or multi-step, emit `plan` first.\n"
+    "2. ALWAYS read the relevant file (with grep or read_file) before editing — never edit blind.\n"
+    "3. For small surgical changes: prefer `search_replace`. For new files: `create_file`. "
+    "Only use `propose_edit` for sweeping rewrites.\n"
+    "4. After an apply, when reasonable, run `curl_self` against the affected endpoint or "
+    "`view_logs backend` to confirm no regression — then `done`.\n"
+    "5. Stay under 8 steps. Be decisive — don't read the same file twice unnecessarily.\n"
+    "6. If the user asks a pure question (no edit needed), one `done` with the answer is enough.\n"
+    "7. NEVER touch .env, .git, node_modules, package.json, requirements.txt — those are "
+    "blocked at the path resolver anyway.\n\n"
+    "Editable scope: anything under /app except the protected list above. "
+    "Common paths: backend/server.py, frontend/src/App.js, frontend/src/App.css, "
+    "frontend/src/index.css, frontend/src/index.js, memory/PRD.md.\n\n"
+    "PATH RULES (critical):\n"
+    "• Paths are RELATIVE to /app — write `backend/server.py`, NOT `/app/backend/server.py`.\n"
+    "• For glob/grep patterns use forms like `backend/**/*.py` or `frontend/src/**/*.js`.\n"
+    "• If grep returns 0 hits, you probably used the wrong path — try omitting `path` (defaults to backend + frontend/src) or use a wider glob.\n"
+    "• If read_file returns 'not a file', double-check the path is relative to /app."
 )
 
 _AGENT_DRAFTS: dict[str, dict] = {}   # in-memory: {session_id: {path, new_content, ...}}
@@ -2430,9 +2705,82 @@ def _normalize_path(p: str) -> str:
     return p
 
 
-async def _run_agent_tool(action: dict, session_key: str, auto_apply: bool) -> dict:
+async def _run_agent_tool(action: dict, session_key: str, auto_apply: bool,
+                          clone_mode: bool = False, auth_token: str = "") -> dict:
     """Execute one agent tool call. Returns a result dict that's sent back to the LLM."""
     tool = (action or {}).get("tool")
+
+    # ── 🧠 E1 Clone-mode tools (only available when clone_mode=True) ──
+    if clone_mode:
+        if tool == "plan":
+            steps = action.get("steps") or []
+            if not isinstance(steps, list):
+                return {"ok": False, "error": "steps must be a list of strings"}
+            return {"ok": True, "plan_recorded": True, "step_count": len(steps),
+                    "hint": "Now execute step 1."}
+        if tool == "glob_files":
+            try:
+                matches = _e1_glob(action.get("pattern", "") or "", limit=80)
+                return {"ok": True, "matches": matches, "count": len(matches)}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if tool == "grep":
+            try:
+                hits = _e1_grep(action.get("pattern", "") or "",
+                                action.get("path", "") or "", limit=40)
+                return {"ok": True, "hits": hits, "count": len(hits)}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if tool == "view_logs":
+            try:
+                text = _e1_tail_log(action.get("service") or "backend",
+                                    int(action.get("lines") or 80))
+                return {"ok": True, "text": text[:8000], "truncated": len(text) > 8000}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if tool == "curl_self":
+            return await _e1_curl_self(
+                action.get("path") or "",
+                method=action.get("method") or "GET",
+                json_body=action.get("json"),
+                token_for_auth=auth_token if action.get("with_auth") else "",
+            )
+        if tool == "search_replace":
+            try:
+                return _e1_stage_search_replace(
+                    action.get("path") or "",
+                    action.get("old_str") or "",
+                    action.get("new_str") or "",
+                    session_key,
+                    replace_all=bool(action.get("replace_all")),
+                )
+            except HTTPException as e:
+                return {"ok": False, "error": str(e.detail)}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if tool == "create_file":
+            try:
+                return _e1_stage_create_file(
+                    action.get("path") or "",
+                    action.get("content") or "",
+                    session_key,
+                )
+            except HTTPException as e:
+                return {"ok": False, "error": str(e.detail)}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        # In clone mode, `read_file` accepts line ranges and the full /app scope:
+        if tool == "read_file":
+            try:
+                p = (action.get("path") or "").lstrip("/")
+                start = int(action.get("start") or 1)
+                end = int(action.get("end") or start + 399)
+                return {"ok": True, **_e1_read(p, start, end)}
+            except HTTPException as e:
+                return {"ok": False, "error": str(e.detail)}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+
     if tool == "list_files":
         return {"ok": True, "files": [
             {"path": p, "description": d} for p, d in EDITABLE_PATHS.items()
@@ -2445,15 +2793,20 @@ async def _run_agent_tool(action: dict, session_key: str, auto_apply: bool) -> d
         return {"ok": True, "path": p, "content": content[:15000],
                 "truncated": len(content) > 15000, "size": len(content)}
     if tool == "propose_edit":
-        p = _normalize_path(action.get("path") or "")
+        p = _normalize_path(action.get("path") or "") if not clone_mode else (action.get("path") or "").lstrip("/")
         instr = (action.get("instruction") or "").strip()
-        if p not in EDITABLE_PATHS:
+        if not clone_mode and p not in EDITABLE_PATHS:
             return {"ok": False, "error": f"path '{p}' not editable", "allowed": list(EDITABLE_PATHS.keys())}
         if len(instr) < 5:
             return {"ok": False, "error": "instruction too short"}
         # Reuse the propose_edit logic
         try:
-            current = _read_file(p)
+            if clone_mode:
+                abs_p = _e1_resolve(p)
+                with open(abs_p, "r", encoding="utf-8") as f:
+                    current = f.read()
+            else:
+                current = _read_file(p)
             lang = "Python (FastAPI)" if p.endswith(".py") else ("React JSX" if p.endswith(".js") else "CSS")
             system = (
                 f"You are a {lang} expert editing the source file '{p}' of Midget jr. "
@@ -2486,9 +2839,26 @@ async def _run_agent_tool(action: dict, session_key: str, auto_apply: bool) -> d
         if not draft:
             return {"ok": False, "error": "no proposed edit in this session"}
         try:
-            current = _read_file(draft["path"])
-            if current == draft["new_content"]:
-                return {"ok": False, "error": "no change vs current file"}
+            # For clone-mode create_file the file doesn't exist yet, so skip the read
+            if draft.get("kind") == "create_file":
+                current = ""
+                abs_p = _e1_resolve(draft["path"])
+                os.makedirs(os.path.dirname(abs_p), exist_ok=True)
+                with open(abs_p, "w", encoding="utf-8") as f:
+                    f.write(draft["new_content"])
+            elif clone_mode and draft.get("kind") == "search_replace":
+                abs_p = _e1_resolve(draft["path"])
+                with open(abs_p, "r", encoding="utf-8") as f:
+                    current = f.read()
+                if current == draft["new_content"]:
+                    return {"ok": False, "error": "no change vs current file"}
+                with open(abs_p, "w", encoding="utf-8") as f:
+                    f.write(draft["new_content"])
+            else:
+                current = _read_file(draft["path"])
+                if current == draft["new_content"]:
+                    return {"ok": False, "error": "no change vs current file"}
+                _write_file(draft["path"], draft["new_content"])
             await self_edits.insert_one({
                 "id": str(uuid.uuid4()),
                 "path": draft["path"],
@@ -2496,9 +2866,8 @@ async def _run_agent_tool(action: dict, session_key: str, auto_apply: bool) -> d
                 "new_content": draft["new_content"],
                 "summary": (action.get("summary") or draft.get("instruction") or "")[:300],
                 "created_at": _now(),
-                "via": "agent",
+                "via": "e1" if clone_mode else "agent",
             })
-            _write_file(draft["path"], draft["new_content"])
             _AGENT_DRAFTS.pop(session_key, None)
             return {"ok": True, "applied": draft["path"]}
         except Exception as e:
@@ -2517,11 +2886,18 @@ async def _run_agent_tool(action: dict, session_key: str, auto_apply: bool) -> d
 @api.post("/admin/agent/chat", dependencies=[Depends(require_admin)])
 async def agent_chat(body: AgentBody, authorization: Optional[str] = Header(None)):
     """Run a multi-step agent turn. The agent emits tool calls one at a time;
-    we execute them in a loop (capped) and return a transcript of what happened."""
-    session_key = (authorization or "")[:60]  # one draft slot per admin token
+    we execute them in a loop (capped) and return a transcript of what happened.
+
+    When body.clone_mode is True, swaps to the 🧠 E1 system prompt + wider tool
+    surface + 8-step cap. Otherwise runs in legacy 'AI Dev lite' mode (4 steps).
+    """
+    clone_mode = bool(body.clone_mode)
+    # Separate draft slot per mode so E1 and AI Dev don't clobber each other
+    session_key = (("e1:" if clone_mode else "lite:") + (authorization or ""))[:80]
     transcript: list[dict] = []
     # Build the seed messages
-    messages: list[dict] = [{"role": "system", "content": AGENT_SYSTEM}]
+    system_prompt = E1_AGENT_SYSTEM if clone_mode else AGENT_SYSTEM
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
     for m in (body.history or [])[-20:]:
         role = m.get("role")
         text = (m.get("content") or "").strip()
@@ -2529,8 +2905,13 @@ async def agent_chat(body: AgentBody, authorization: Optional[str] = Header(None
             messages.append({"role": role, "content": text[:8000]})
     messages.append({"role": "user", "content": body.message})
 
+    # Extract bearer token (no "Bearer " prefix) for curl_self with auth
+    auth_token = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        auth_token = authorization.split(None, 1)[1].strip()
+
     final_message = ""
-    max_steps = 4
+    max_steps = 8 if clone_mode else 4
     for step in range(max_steps):
         try:
             reply = await llm_chat(messages, temperature=0.2)
@@ -2548,7 +2929,8 @@ async def agent_chat(body: AgentBody, authorization: Optional[str] = Header(None
             break
         transcript.append({"type": "action", "action": action})
         messages.append({"role": "assistant", "content": reply})
-        result = await _run_agent_tool(action, session_key, body.auto_apply)
+        result = await _run_agent_tool(action, session_key, body.auto_apply,
+                                        clone_mode=clone_mode, auth_token=auth_token)
         transcript.append({"type": "result", "result": result})
         # Feed result back as a TOOL-ROLE message (clean — no "TOOL RESULT:" prefix
         # so the LLM doesn't echo it as prose).
@@ -2562,23 +2944,51 @@ async def agent_chat(body: AgentBody, authorization: Optional[str] = Header(None
         if _AGENT_DRAFTS.get(session_key):
             final_message = "I drafted the change but ran out of steps before wrapping up. The pending draft is below — click ✅ Apply to write it."
         else:
-            final_message = "Couldn't finish in 4 steps. Try giving me a more specific instruction (which file + what to change)."
+            final_message = f"Couldn't finish in {max_steps} steps. Try giving me a more specific instruction (which file + what to change)."
 
     return {"transcript": transcript, "reply": final_message,
-            "pending_draft": _AGENT_DRAFTS.get(session_key, None)}
+            "pending_draft": _AGENT_DRAFTS.get(session_key, None),
+            "clone_mode": clone_mode, "max_steps": max_steps}
 
 
 @api.post("/admin/agent/apply", dependencies=[Depends(require_admin)])
-async def agent_apply(authorization: Optional[str] = Header(None)):
-    """Apply the agent's most recent pending draft (used when auto_apply is OFF)."""
-    session_key = (authorization or "")[:60]
+async def agent_apply(authorization: Optional[str] = Header(None),
+                       clone_mode: bool = False):
+    """Apply the agent's most recent pending draft (used when auto_apply is OFF).
+
+    `clone_mode` query param picks which draft slot to apply (E1 vs AI Dev lite).
+    """
+    session_key = (("e1:" if clone_mode else "lite:") + (authorization or ""))[:80]
     draft = _AGENT_DRAFTS.get(session_key)
     if not draft:
         raise HTTPException(404, "No pending draft.")
-    current = _read_file(draft["path"])
-    if current == draft["new_content"]:
-        _AGENT_DRAFTS.pop(session_key, None)
-        return {"applied": False, "reason": "No change."}
+    abs_path = None
+    try:
+        if draft.get("kind") == "create_file":
+            abs_path = _e1_resolve(draft["path"])
+            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            current = ""
+            with open(abs_path, "w", encoding="utf-8") as f:
+                f.write(draft["new_content"])
+        elif clone_mode:
+            abs_path = _e1_resolve(draft["path"])
+            with open(abs_path, "r", encoding="utf-8") as f:
+                current = f.read()
+            if current == draft["new_content"]:
+                _AGENT_DRAFTS.pop(session_key, None)
+                return {"applied": False, "reason": "No change."}
+            with open(abs_path, "w", encoding="utf-8") as f:
+                f.write(draft["new_content"])
+        else:
+            current = _read_file(draft["path"])
+            if current == draft["new_content"]:
+                _AGENT_DRAFTS.pop(session_key, None)
+                return {"applied": False, "reason": "No change."}
+            _write_file(draft["path"], draft["new_content"])
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"apply failed: {e}")
     await self_edits.insert_one({
         "id": str(uuid.uuid4()),
         "path": draft["path"],
@@ -2586,16 +2996,16 @@ async def agent_apply(authorization: Optional[str] = Header(None)):
         "new_content": draft["new_content"],
         "summary": (draft.get("instruction") or "")[:300],
         "created_at": _now(),
-        "via": "agent",
+        "via": "e1" if clone_mode else "agent",
     })
-    _write_file(draft["path"], draft["new_content"])
     _AGENT_DRAFTS.pop(session_key, None)
     return {"applied": True, "path": draft["path"]}
 
 
 @api.post("/admin/agent/discard", dependencies=[Depends(require_admin)])
-async def agent_discard(authorization: Optional[str] = Header(None)):
-    session_key = (authorization or "")[:60]
+async def agent_discard(authorization: Optional[str] = Header(None),
+                         clone_mode: bool = False):
+    session_key = (("e1:" if clone_mode else "lite:") + (authorization or ""))[:80]
     _AGENT_DRAFTS.pop(session_key, None)
     return {"discarded": True}
 
